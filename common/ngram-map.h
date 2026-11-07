@@ -24,10 +24,27 @@
 struct common_ngram_simple_config {
     uint16_t   size_ngram;      // size of n-grams to lookup in self-mode
     uint16_t   size_mgram;      // size of m-grams to draft in self-mode
+    uint16_t   size_ngram_min = 0; // if > 0: n-grams down to this size are looked up when longer ones have no match
 };
 
 // Searches for a n-gram in the history and checks whether a draft sequence should be generated.
 llama_tokens common_ngram_simple_draft(
+        const common_ngram_simple_config & config,
+        const llama_tokens & tokens, llama_token sampled);
+
+// the longest n-gram (size_ngram down to size_ngram_min, or just size_ngram) ending with the sampled
+// token that occurred before: the tokens that followed its most recent occurrence (at most size_mgram),
+// ell, how many tokens up to the sampled one agree with those before that occurrence (n or more, at
+// most COMMON_NGRAM_SIMPLE_MAX_ELL), and whether its other earlier occurrences were followed by the
+// same token; next is empty when there is no match
+#define COMMON_NGRAM_SIMPLE_MAX_ELL 64
+struct common_ngram_simple_match {
+    size_t       ell   = 0;
+    bool         agree = true;
+    llama_tokens next;
+};
+
+common_ngram_simple_match common_ngram_simple_find(
         const common_ngram_simple_config & config,
         const llama_tokens & tokens, llama_token sampled);
 
