@@ -161,6 +161,8 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // ggml_backend_tensor_set can set a part of a tensor (offset > 0 or size < ggml_nbytes)
+        bool set_tensor_partial;
     };
 
     // all the device properties

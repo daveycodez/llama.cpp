@@ -1680,16 +1680,51 @@ bool llama_model_loader::load_all_data(
         tensors.push_back(cur);
     }
 
-    // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
-    // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
-    if (!use_mmap) {
-        std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
-            const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
-            const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
-            if (staged_a != staged_b) {
-                return staged_a;
+    // without mmap, tensors in non-host buffers are staged through a host buffer, unless they use the async uploads
+    // a device that can set part of a tensor gets them in pieces, through one buffer of LLAMA_DIRECT_IO_BUFFER_SIZE bytes
+    // other tensors are staged whole: biggest-first, so the largest staging buffer is allocated while the fewest weights are resident
+    std::unordered_set<const ggml_tensor *> staged_whole;
+    if (!use_mmap && !upload_backend) {
+        std::map<ggml_backend_buffer_type_t, bool> buft_whole;
+        for (const ggml_tensor * t : tensors) {
+            if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
             }
-            return staged_a && ggml_nbytes(a) > ggml_nbytes(b);
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+            auto it = buft_whole.find(buft);
+            if (it == buft_whole.end()) {
+                bool whole = true;
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (!check_tensors && dev && buft == ggml_backend_dev_buffer_type(dev)) {
+                    ggml_backend_dev_props props;
+                    ggml_backend_dev_get_props(dev, &props);
+                    whole = !props.caps.set_tensor_partial;
+                }
+                it = buft_whole.emplace(buft, whole).first;
+            }
+            if (it->second) {
+                staged_whole.insert(t);
+            }
+        }
+    }
+
+    // the other tensors go in file order, so the reads move forward through the file
+    if (!use_mmap) {
+        std::stable_sort(tensors.begin(), tensors.end(), [&](const ggml_tensor * a, const ggml_tensor * b) {
+            const bool whole_a = staged_whole.count(a) > 0;
+            const bool whole_b = staged_whole.count(b) > 0;
+            if (whole_a != whole_b) {
+                return whole_a;
+            }
+            if (whole_a) {
+                return ggml_nbytes(a) > ggml_nbytes(b);
+            }
+            const auto * wa = get_weight(ggml_get_name(a));
+            const auto * wb = get_weight(ggml_get_name(b));
+            if (wa == nullptr || wb == nullptr) {
+                return false;
+            }
+            return std::make_pair(wa->idx, wa->offs) < std::make_pair(wb->idx, wb->offs);
         });
     }
 
@@ -1812,6 +1847,24 @@ bool llama_model_loader::load_all_data(
 
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
+                    }
+                } else if (staged_whole.count(cur) == 0) {
+                    // read the aligned range around the tensor in pieces and set the part of the tensor in each
+                    const size_t align      = file->read_alignment();
+                    const size_t read_start = weight->offs & ~(align - 1);
+                    const size_t read_end   = (weight->offs + n_size + align - 1) & ~(align - 1);
+                    const size_t piece_size = LLAMA_DIRECT_IO_BUFFER_SIZE;
+                    if (read_buf.size() < piece_size + align - 1) {
+                        read_buf.resize(piece_size + align - 1);
+                    }
+                    uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) read_buf.data(), align);
+                    file->seek(read_start, SEEK_SET);
+                    for (size_t pos = read_start; pos < read_end; pos += piece_size) {
+                        const size_t n = std::min(piece_size, read_end - pos);
+                        file->read_raw_unsafe(read_dst, n);
+                        const size_t beg = std::max(pos, weight->offs);
+                        const size_t end = std::min(pos + n, weight->offs + n_size);
+                        ggml_backend_tensor_set(cur, read_dst + (beg - pos), beg - weight->offs, end - beg);
                     }
                 } else {
                     // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
