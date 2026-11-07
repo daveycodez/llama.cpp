@@ -4517,8 +4517,12 @@ static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     ctx->webgpu_global_ctx->command_submit_batch_size = ggml_backend_webgpu_get_command_submit_batch_size();
     ctx->webgpu_global_ctx->max_inflight_batches      = ggml_backend_webgpu_get_max_inflight_batches();
     ctx->webgpu_global_ctx->vendor                    = info.vendor;
+    // The subgroup shaders use @builtin(subgroup_id), a WGSL language feature
+    // that shipped after the subgroups feature: browsers can have one without
+    // the other (Chrome 141, for one), and fail to compile those shaders.
     ctx->webgpu_global_ctx->capabilities.supports_subgroups =
-        ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::Subgroups);
+        ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::Subgroups) &&
+        ctx->webgpu_global_ctx->instance.HasWGSLLanguageFeature(wgpu::WGSLLanguageFeatureName::SubgroupId);
     // for dot4I8packed
     ctx->webgpu_global_ctx->capabilities.supports_dot_product = ctx->webgpu_global_ctx->instance.HasWGSLLanguageFeature(
         wgpu::WGSLLanguageFeatureName::Packed4x8IntegerDotProduct);
@@ -4543,7 +4547,9 @@ static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
         }
     }
 #endif
-    ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix = valid_subgroup_matrix_config;
+    // the subgroup matrix shaders use subgroup_id too
+    ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix =
+        valid_subgroup_matrix_config && ctx->webgpu_global_ctx->capabilities.supports_subgroups;
 
     // Runtime subgroup size can be any supported size in this range. Shaders
     // that allocate per-lane register arrays must size them for the minimum.
