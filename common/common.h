@@ -405,7 +405,33 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (needs_rs_seq) {
+            return draft.n_max;
+        }
+
+        // the drafters without a draft model: keep snapshots of the recurrent state for their drafts too, so
+        // that recurrent models roll a rejected draft back on the device instead of restoring a checkpoint;
+        // only for drafters whose drafts can be that short (a longer draft still uses the checkpoint)
+        const uint32_t n_rs_max = 8;
+
+        uint32_t n = 0;
+        auto add = [&](uint32_t d_min, uint32_t d_max) {
+            if (d_min <= n_rs_max) {
+                n = std::max(n, std::min(d_max, n_rs_max));
+            }
+        };
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  add(std::min(ngram_simple.size_n, ngram_simple.size_m), ngram_simple.size_m); break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   add(1, ngram_map_k.size_m);                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: add(1, ngram_map_k4v.size_m);                  break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     add(ngram_mod.n_min, ngram_mod.n_max);         break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   add(1, n_rs_max);                              break;
+                default: break;
+            }
+        }
+
+        return n;
     }
 };
 
