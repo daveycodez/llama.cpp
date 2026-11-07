@@ -369,6 +369,8 @@ struct common_params_speculative_ngram_map {
     uint16_t size_n   = 12; // ngram size for lookup
     uint16_t size_m   = 48; // mgram size for speculative tokens
     uint16_t min_hits = 1;  // minimum hits at ngram/mgram lookup for mgram to be proposed
+
+    uint16_t size_n_min = 0; // ngram-simple: if > 0, look up n-grams down to this size and pick the draft length by cost
 };
 
 struct common_params_speculative_ngram_cache {

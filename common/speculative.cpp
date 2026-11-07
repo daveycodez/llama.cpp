@@ -2023,13 +2023,146 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
                 this->params.size_n, this->params.size_m, this->params.min_hits);
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (seq_id < (llama_seq_id) seqs.size()) {
+            seqs[seq_id] = {};
+        }
     }
 
     bool process(const common_batch & /*batch*/) override {
         // TODO: implement
         return true;
+    }
+
+    // Cost-based drafting (size_ngram_min > 0). After the longest n-gram match (see
+    // common_ngram_simple_find), the token that followed its earlier occurrence is the next one with a
+    // probability that grows with ell, how far back the match goes. Per sequence, that probability is
+    // estimated for buckets of ell from what was generated after the matches it drafted from, starting
+    // from a prior. Drafting k tokens gives 1 + p1 + p1 p2 + ... + p1 .. pk tokens per pass (pi for match
+    // length ell + i - 1) for a pass of k + 1 tokens: the drafter takes the k with the most tokens per
+    // unit of time, by the time a pass of each size takes (measured as the time between drafts, starting
+    // from a prior), and drafts nothing unless that beats one token per one-token pass by 5%, or when the
+    // match's older occurrences were followed by other tokens.
+    static constexpr int N_BUCKETS = 7;
+    static int bucket(size_t ell) {
+        static const size_t lo[N_BUCKETS] = { 1, 2, 3, 4, 5, 7, 11 };
+        int b = 0;
+        while (b + 1 < N_BUCKETS && ell >= lo[b + 1]) {
+            b++;
+        }
+        return b;
+    }
+    // prior probabilities by bucket (measured on greedy chat outputs of small models) and their weight in observations
+    static constexpr float prior[N_BUCKETS] = { 0.30f, 0.40f, 0.70f, 0.69f, 0.77f, 0.80f, 0.97f };
+    static constexpr float prior_weight     = 3.0f;
+    static constexpr float min_gain         = 1.05f;
+    static constexpr float cost_weight      = 4.0f; // weight of the prior pass time, in passes measured
+
+    // prior time of a pass of b tokens, relative to one token
+    static float prior_cost(int b) {
+        static const float c[9] = { 0.0f, 1.0f, 1.45f, 1.75f, 2.1f, 2.45f, 2.8f, 3.15f, 3.5f };
+        return b <= 8 ? c[b] : c[8] + 0.35f * (b - 8);
+    }
+
+    struct seq_state {
+        float        acc[N_BUCKETS] = {};
+        float        cnt[N_BUCKETS] = {};
+        size_t       pred_pos = 0; // position of the first predicted token
+        size_t       pred_ell = 0;
+        llama_tokens pred;         // the tokens predicted after the last match, to check
+        int64_t      t_last   = 0; // when the last draft was made, and the size of that pass
+        int          b_last   = 0;
+    };
+    std::vector<seq_state> seqs = std::vector<seq_state>(n_seq);
+
+    // the time of a pass of each size, shared by the sequences: moving averages, and passes measured;
+    // and the measurements rejected in a row as no pass time
+    std::vector<float> t_pass = std::vector<float>(params.size_m + 2, 0.0f);
+    std::vector<int>   n_pass = std::vector<int>  (params.size_m + 2, 0);
+    int                n_rejected = 0;
+
+    // relative time of a pass of b tokens: the measured ratio to one token, mixed with the prior; a size not
+    // measured yet is extrapolated linearly from the largest size measured
+    float pass_cost(int b) const {
+        if (n_pass[1] < 3 || t_pass[1] <= 0.0f) {
+            return prior_cost(b);
+        }
+        if (n_pass[b] == 0) {
+            for (int b0 = b - 1; b0 > 1; b0--) {
+                if (n_pass[b0] > 0) {
+                    return 1.0f + (pass_cost(b0) - 1.0f) * (b - 1) / (b0 - 1);
+                }
+            }
+            return prior_cost(b);
+        }
+        const float w = (float) n_pass[b];
+        return (w * t_pass[b] / t_pass[1] + cost_weight * prior_cost(b)) / (w + cost_weight);
+    }
+
+    void measure_pass(seq_state & st) {
+        const int64_t now = ggml_time_us();
+        if (st.t_last > 0 && st.b_last >= 1 && st.b_last < (int) t_pass.size()) {
+            const float dt = (float) (now - st.t_last);
+            const int   b  = st.b_last;
+            // a pause, a prompt or a skipped draft in between is no pass time; but a third slow pass in a
+            // row is one (the device got slower, e.g. thermal throttling, and the averages must follow)
+            const float expect = n_pass[1] >= 3 ? t_pass[1] * pass_cost(b) : 0.0f;
+            if (expect == 0.0f || dt < 1.7f * expect || n_rejected >= 2) {
+                t_pass[b] = n_pass[b] == 0 ? dt : 0.85f * t_pass[b] + 0.15f * dt;
+                n_pass[b]++;
+                n_rejected = 0;
+            } else {
+                n_rejected++;
+            }
+        }
+        st.t_last = now;
+    }
+
+    llama_tokens draft_cost_based(seq_state & st, const llama_tokens & tokens, llama_token sampled, int32_t n_max) {
+        measure_pass(st);
+        st.b_last = 1;
+        const size_t n_tot = tokens.size() + 1;
+        auto at = [&](size_t i) { return i < tokens.size() ? tokens[i] : sampled; };
+        // what the last prediction got right, up to its first miss
+        for (size_t i = 0; i < st.pred.size() && st.pred_pos + i < n_tot; i++) {
+            const int b = bucket(st.pred_ell + i);
+            st.cnt[b] += 1.0f;
+            if (at(st.pred_pos + i) != st.pred[i]) {
+                break;
+            }
+            st.acc[b] += 1.0f;
+        }
+        st.pred.clear();
+        common_ngram_simple_match m = common_ngram_simple_find(config, tokens, sampled);
+        if (m.next.empty() || !m.agree) {
+            return {};
+        }
+        st.pred_pos = n_tot;
+        st.pred_ell = m.ell;
+        st.pred     = m.next;
+        size_t k_max = std::min<size_t>(m.next.size(), t_pass.size() - 2);
+        if (n_max >= 0) {
+            k_max = std::min<size_t>(k_max, (size_t) n_max);
+        }
+        size_t best_k = 0;
+        float  best   = min_gain / pass_cost(1);
+        float  e      = 1.0f;
+        float  prod   = 1.0f;
+        float  c_prev = pass_cost(1);
+        for (size_t k = 1; k <= k_max; k++) {
+            const int b = bucket(m.ell + k - 1);
+            prod *= (st.acc[b] + prior_weight * prior[b]) / (st.cnt[b] + prior_weight);
+            e += prod;
+            const float c = std::max(c_prev, pass_cost((int) k + 1));
+            c_prev = c;
+            if (e / c > best) {
+                best   = e / c;
+                best_k = k;
+            }
+        }
+        st.b_last = (int) best_k + 1;
+        m.next.resize(best_k);
+        return m.next;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -2041,12 +2174,17 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
                 continue;
             }
 
+            if (config.size_ngram_min > 0) {
+                *dp.result = draft_cost_based(seqs[seq_id], *dp.prompt, dp.id_last, dp.n_max);
+                continue;
+            }
+
             *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
         }
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+        // noop (the next draft checks the last prediction against what was generated)
     }
 };
 
@@ -2926,8 +3064,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 uint16_t mgram_size_value = ngram_map.size_value;
 
                 auto config_simple = common_ngram_simple_config {
-                    /* .size_ngram = */ ngram_size_key,
-                    /* .size_mgram = */ mgram_size_value
+                    /* .size_ngram     = */ ngram_size_key,
+                    /* .size_mgram     = */ mgram_size_value,
+                    /* .size_ngram_min = */ config.params.ngram_simple.size_n_min,
                 };
                 auto state = std::make_unique<common_speculative_impl_ngram_simple>(
                     /* .params = */ config.params,

@@ -37,6 +37,48 @@ static std::string common_tokens_to_str(const llama_tokens & inp, size_t start, 
 // n-gram simple
 //
 
+common_ngram_simple_match common_ngram_simple_find(
+        const common_ngram_simple_config & config,
+        const llama_tokens & tokens, llama_token sampled) {
+    common_ngram_simple_match res;
+    const size_t cur_len = tokens.size();
+    const size_t n_tot   = cur_len + 1; // the history and the sampled token
+    auto at = [&](size_t i) { return i < cur_len ? tokens[i] : sampled; };
+    const size_t n_min = config.size_ngram_min > 0 ? std::min(config.size_ngram_min, config.size_ngram) : config.size_ngram;
+    for (size_t n = config.size_ngram; n >= n_min && n > 0; --n) {
+        if (n_tot <= n) {
+            continue;
+        }
+        for (size_t j = n_tot - n; j-- > 0;) {
+            size_t k = 0;
+            while (k < n && at(j + k) == at(n_tot - n + k)) {
+                k++;
+            }
+            if (k == n) {
+                size_t ell = n;
+                while (ell < COMMON_NGRAM_SIMPLE_MAX_ELL && j + n >= ell + 1 && at(j + n - ell - 1) == at(n_tot - ell - 1)) {
+                    ell++;
+                }
+                res.ell = ell;
+                const size_t end = std::min(j + n + config.size_mgram, n_tot);
+                for (size_t i = j + n; i < end; i++) {
+                    res.next.push_back(at(i));
+                }
+                // the older occurrences: followed by the same token?
+                for (size_t o = j; o-- > 0 && res.agree;) {
+                    size_t q = 0;
+                    while (q < n && at(o + q) == at(n_tot - n + q)) {
+                        q++;
+                    }
+                    res.agree = q < n || at(o + n) == at(j + n);
+                }
+                return res;
+            }
+        }
+    }
+    return res;
+}
+
 /**
  * Perform speculative generation using the model's own token history.
  * Searches for a matching pattern in the token history and returns draft tokens.
