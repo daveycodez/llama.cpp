@@ -93,6 +93,10 @@ static inline uint32_t ggml_webgpu_u32_from_f32(float value) {
 #define WEBGPU_PARAMS_BUF_SIZE_BYTES             128  // enough for 32 parameters
 #define WEBGPU_SET_ROWS_ERROR_BUF_SIZE_BYTES     4
 #define WEBGPU_STORAGE_BUF_BINDING_MULT          4    // a storage buffer binding size must be a multiple of 4
+#define WEBGPU_PVR_COMMAND_SUBMIT_BATCH_SIZE     16u
+#define WEBGPU_PVR_FIRST_SUBMIT_BATCH_SIZE       4u
+#define WEBGPU_PVR_RMS_NORM_MUL_WG_SIZE          128u
+#define WEBGPU_PVR_READBACK_MAX_BYTES            (32u << 20)  // state buffers read back whole on PowerVR (the recurrent state with its snapshots)
 
 /* End Constants */
 
@@ -124,6 +128,10 @@ struct webgpu_param_arena {
     uint32_t     slot_count  = 0;
     uint32_t     next_slot   = 0;
 
+    // PowerVR: the batch's parameters are written with one WriteBuffer at submit
+    std::vector<uint8_t> shadow;
+    size_t               shadow_end = 0;
+
     void init(wgpu::Device device, size_t slot_size, uint32_t slot_count, size_t alignment) {
         this->slot_stride = ROUNDUP_POW2(slot_size, alignment);
         this->slot_size   = slot_size;
@@ -144,6 +152,21 @@ struct webgpu_param_arena {
     }
 
     void reset() { next_slot = 0; }
+
+    void write_deferred(size_t offset, const void * data, size_t size) {
+        if (shadow.size() < slot_stride * slot_count) {
+            shadow.resize(slot_stride * slot_count);
+        }
+        memcpy(shadow.data() + offset, data, size);
+        shadow_end = std::max(shadow_end, offset + size);
+    }
+
+    void flush(wgpu::Queue & queue) {
+        if (shadow_end > 0) {
+            queue.WriteBuffer(buffer, 0, shadow.data(), ROUNDUP_POW2(shadow_end, 4));
+            shadow_end = 0;
+        }
+    }
 
     void cleanup() {
         if (buffer) {
@@ -209,6 +232,18 @@ struct webgpu_global_context_struct {
 
     std::string vendor;
 
+    // No work was submitted since the queue was last seen idle. Only used on
+    // PowerVR (see ggml_backend_webgpu_synchronize).
+    bool queue_idle = false;
+
+    // PowerVR: bumped by everything that may write a buffer (submissions,
+    // WriteBuffer), and a copy of a small buffer read back at that count
+    // (see ggml_backend_webgpu_buffer_get_tensor)
+    uint64_t             pvr_write_epoch    = 0;
+    WGPUBuffer           pvr_readback_src   = nullptr;
+    uint64_t             pvr_readback_epoch = 0;
+    std::vector<uint8_t> pvr_readback_data;
+
     // TODO: We should rework the CPU profiling time handling to make it more useful. ref: https://github.com/ggml-org/llama.cpp/pull/22050
 #ifdef GGML_WEBGPU_CPU_PROFILE
     // Profiling: labeled CPU time in ms (total)
@@ -254,6 +289,108 @@ struct webgpu_global_context_struct {
 
 typedef std::shared_ptr<webgpu_global_context_struct> webgpu_global_context;
 
+// Imagination PowerVR GPUs (vendor "img-tec"), on which several paths below
+// differ: see ggml_webgpu_mul_mat_pvr, ggml_webgpu_flash_attn_pvr and
+// ggml_backend_webgpu_synchronize.
+static bool ggml_webgpu_is_pvr(const webgpu_global_context & global_ctx) {
+    return global_ctx->vendor == "img-tec";
+}
+
+// On PowerVR, Q4_K and Q6_K matrices are repacked as they are uploaded, in
+// place (the same bytes, moved), into the layout that mul_mat_vec_pvr.wgsl
+// reads fastest ("layout A"): block b of row r becomes block b * rows + r, so
+// neighbouring rows' blocks are neighbours, and each block's parts sit in
+// planes of their own, every load aligned. Q4_K: headers (d, dmin, scales, 16
+// bytes), then quants (128 bytes). Q6_K: ql (128 bytes, piece p's 4 words
+// at 64 n + 8 (p % 4) and + 32, n = p / 4, together), qh (64 bytes, piece
+// p's 2 words at 32 n + 8 (p % 4) together), scales (16), d (2). The values
+// read, and so every product, are those of the original layout. Repacked
+// tensors are marked by tensor->extra; only the PowerVR matrix products read
+// them, and reading one back gives the original layout.
+static char ggml_webgpu_pvr_repacked_marker;
+
+static bool ggml_webgpu_pvr_is_repacked(const ggml_tensor * t) {
+    return t->extra == &ggml_webgpu_pvr_repacked_marker;
+}
+
+// Whether a tensor is repacked when it is uploaded whole.
+static bool ggml_webgpu_pvr_repackable(const webgpu_global_context & global_ctx, const ggml_tensor * t) {
+    return ggml_webgpu_is_pvr(global_ctx) && (t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q6_K) &&
+           t->view_src == nullptr && t->ne[0] % 256 == 0 && t->ne[1] % 4 == 0 && t->ne[2] == 1 && t->ne[3] == 1 &&
+           ggml_is_contiguous(t) && t->buffer != nullptr &&
+           ggml_webgpu_tensor_offset(t) % global_ctx->capabilities.limits.minStorageBufferOffsetAlignment == 0;
+}
+
+// Whether an op reads a tensor that is, or may become, repacked, or a view of one.
+static bool ggml_webgpu_pvr_reads_repackable(const webgpu_global_context & global_ctx, const ggml_tensor * t) {
+    if (t == nullptr || !ggml_webgpu_is_pvr(global_ctx) || (t->type != GGML_TYPE_Q4_K && t->type != GGML_TYPE_Q6_K)) {
+        return false;
+    }
+    const ggml_tensor * base = t->view_src ? t->view_src : t;
+    return base->ne[0] % 256 == 0 && base->ne[1] % 4 == 0 && base->ne[2] == 1 && base->ne[3] == 1 &&
+           ggml_is_contiguous(base);
+}
+
+// Moves the bytes of block column b (rows m) of a whole tensor between the
+// original layout (orig) and layout A (a): to_a copies orig into a, else a
+// into orig. nblk is the tensor's block count; a holds whole planes.
+static void ggml_webgpu_pvr_repack_column(ggml_type type, int64_t m, int64_t nb, int64_t b, bool to_a, uint8_t * orig,
+                                          uint8_t * a) {
+    const int64_t nblk = m * nb;
+    for (int64_t r = 0; r < m; r++) {
+        const int64_t blk = b * m + r;
+        if (type == GGML_TYPE_Q4_K) {
+            uint8_t * o = orig + (r * nb + b) * 144;
+            // header, then the 128 bytes of quants
+            uint8_t * h = a + blk * 16;
+            uint8_t * q = a + nblk * 16 + blk * 128;
+            if (to_a) {
+                memcpy(h, o, 16);
+                memcpy(q, o + 16, 128);
+            } else {
+                memcpy(o, h, 16);
+                memcpy(o + 16, q, 128);
+            }
+        } else {
+            uint8_t * o = orig + (r * nb + b) * 210;
+            for (int p = 0; p < 8; p++) {
+                const int n  = p >> 2;
+                const int l0 = 8 * (p & 3);
+                uint8_t * ql = a + blk * 128 + 16 * p;
+                uint8_t * qh = a + nblk * 128 + blk * 64 + 8 * p;
+                uint8_t * oa = o + 64 * n + l0;
+                uint8_t * oh = o + 128 + 32 * n + l0;
+                if (to_a) {
+                    memcpy(ql, oa, 8);
+                    memcpy(ql + 8, oa + 32, 8);
+                    memcpy(qh, oh, 8);
+                } else {
+                    memcpy(oa, ql, 8);
+                    memcpy(oa + 32, ql + 8, 8);
+                    memcpy(oh, qh, 8);
+                }
+            }
+            uint8_t * sc = a + nblk * 192 + blk * 16;
+            uint8_t * d  = a + nblk * 208 + blk * 2;
+            if (to_a) {
+                memcpy(sc, o + 192, 16);
+                memcpy(d, o + 208, 2);
+            } else {
+                memcpy(o + 192, sc, 16);
+                memcpy(o + 208, d, 2);
+            }
+        }
+    }
+}
+
+// PowerVR: where a fused short convolution's nodes sit in the graph (see
+// ggml_webgpu_pvr_shortconv_nodes): the gather, B * X, the CONCAT, SSM_CONV,
+// the MUL by C (where the fused op runs) and the snapshots' CPYs, slot 0 first
+struct ggml_webgpu_pvr_shortconv_at {
+    int              gi = -1, bi = -1, ci = -1, si = -1, yi = -1;
+    std::vector<int> snaps;
+};
+
 // All the base objects needed to run operations on a WebGPU device
 struct webgpu_context_struct {
     // Points to global instances owned by ggml_backend_webgpu_reg_context
@@ -267,6 +404,41 @@ struct webgpu_context_struct {
     wgpu::CommandEncoder     active_command_encoder;
     wgpu::ComputePassEncoder active_compute_pass;
     bool                     batch_compute_passes = true;
+
+    // PowerVR matrix products: a buffer of its own for src1, so that it can be
+    // bound read-only (see ggml_webgpu_mul_mat_pvr)
+    // (two, so that an op can write the next product's src1 while it reads its own)
+    wgpu::Buffer pvr_staging_buf[2];
+    size_t       pvr_staging_size[2] = { 0, 0 };
+    int          pvr_staged_idx      = 0;  // the one that holds pvr_staged_src1
+    // the src1 the staging buffer holds, while no other op ran since: products
+    // with the same src1 back to back (FFN gate and up) skip the copy
+    const ggml_tensor * pvr_staged_src1 = nullptr;
+    bool                pvr_staged_f16  = false;  // ... packed as f16 (for mul_mat_pvr_gemm.wgsl)
+    // the op just encoded wrote pvr_staged_src1 itself (its output, also into the staging buffer)
+    bool                pvr_staged_by_op = false;
+    // PowerVR prompt batches: the weights dequantized to f16, in a texture
+    // (see mul_mat_pvr_dequant.wgsl)
+    wgpu::Texture     pvr_dequant_tex;
+    wgpu::TextureView pvr_dequant_view;
+    uint32_t          pvr_dequant_rows = 0;
+    // PowerVR logits top-k: its scratch space (see ggml_webgpu_topk_pvr), a buffer
+    // of its own so that the logits and the scratch are each bound read-only
+    // where they are only read
+    wgpu::Buffer pvr_topk_buf;
+    size_t       pvr_topk_size = 0;
+    // PowerVR: the short convolutions fused in the last graph (see
+    // ggml_webgpu_pvr_shortconv_nodes), found again when a graph differs from
+    // it: its nodes, their outputs, shapes and sources (sig), the nodes the
+    // fused ops replace (skip), and the fused ops by the index where each runs
+    struct {
+        const ggml_cgraph *                                   graph = nullptr;
+        std::vector<uintptr_t>                                sig;
+        std::vector<uint8_t>                                  skip;
+        std::unordered_map<int, ggml_webgpu_pvr_shortconv_at> fused;
+    } pvr_sc;
+    // PowerVR: a product of a few columns was split per column (logged once)
+    bool pvr_split_logged = false;
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
     // Profiling: per-shader GPU time in ms
@@ -295,6 +467,21 @@ struct webgpu_context_struct {
         if (this->set_rows_host_error_buf) {
             this->set_rows_host_error_buf.Destroy();
             this->set_rows_host_error_buf = nullptr;
+        }
+        if (this->pvr_topk_buf) {
+            this->pvr_topk_buf.Destroy();
+            this->pvr_topk_buf = nullptr;
+        }
+        for (wgpu::Buffer & buf : this->pvr_staging_buf) {
+            if (buf) {
+                buf.Destroy();
+                buf = nullptr;
+            }
+        }
+        if (this->pvr_dequant_tex) {
+            this->pvr_dequant_view = nullptr;
+            this->pvr_dequant_tex.Destroy();
+            this->pvr_dequant_tex = nullptr;
         }
         if (this->set_rows_dev_error_buf) {
             this->set_rows_dev_error_buf.Destroy();
@@ -541,6 +728,7 @@ static void ggml_backend_webgpu_wait_queue(webgpu_global_context & ctx) {
 
     ggml_backend_webgpu_check_wait_status(wait_status, callback_status, wgpu::QueueWorkDoneStatus::Success,
                                           "Queue wait", "Queue work", callback_message.c_str());
+    ctx->queue_idle = true;
 }
 
 static void ggml_backend_webgpu_map_buffer(webgpu_global_context & ctx,
@@ -571,6 +759,9 @@ static void ggml_backend_webgpu_submit_commands(webgpu_context &          ctx,
         num_inflight_batches = 0;
     }
 
+    ctx->param_arena.flush(ctx->global_ctx->queue);
+    ctx->global_ctx->queue_idle = false;
+    ctx->global_ctx->pvr_write_epoch++;
     ctx->global_ctx->queue.Submit(1, &commands);
     num_inflight_batches++;
 }
@@ -617,9 +808,16 @@ static webgpu_encoded_op ggml_backend_webgpu_build_multi(webgpu_context &       
         param_offsets.push_back(param_offset);
     }
 
+    const bool defer_params = ggml_webgpu_is_pvr(ctx->global_ctx);
     for (size_t i = 0; i < param_offsets.size(); i++) {
-        ctx->global_ctx->queue.WriteBuffer(ctx->param_arena.buffer, param_offsets[i], dispatches[i].params.data(),
-                                           dispatches[i].params.size() * sizeof(uint32_t));
+        if (defer_params) {
+            // one WriteBuffer per batch instead of one per dispatch
+            ctx->param_arena.write_deferred(param_offsets[i], dispatches[i].params.data(),
+                                            dispatches[i].params.size() * sizeof(uint32_t));
+        } else {
+            ctx->global_ctx->queue.WriteBuffer(ctx->param_arena.buffer, param_offsets[i], dispatches[i].params.data(),
+                                               dispatches[i].params.size() * sizeof(uint32_t));
+        }
     }
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
@@ -725,6 +923,8 @@ static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
 
         wgpu::CommandBuffer              command  = encoder.Finish();
         std::vector<wgpu::CommandBuffer> commands = { command };
+        ctx->queue_idle                           = false;
+        ctx->pvr_write_epoch++;
         ctx->queue.Submit(commands.size(), commands.data());
 
         offset += chunk_size;
@@ -1681,10 +1881,531 @@ static void ggml_webgpu_quantize_q8_dispatch(webgpu_context &                   
     });
 }
 
+// Imagination PowerVR GPUs read storage bindings declared read_write several
+// times slower than read-only ones, which all the generic shaders use, and
+// run the tiled mat-mat shaders slowly. Matrix products of the K-quants go
+// through shaders of their own there, which read every operand through
+// read-only bindings: mul_mat_vec_pvr.wgsl for one column, mul_mat_pvr.wgsl
+// for a few, and for prompt batches mul_mat_pvr_dequant.wgsl, which writes
+// the weights out as f16, then mul_mat_pvr_gemm.wgsl.
+
+// Columns from which prompt batches dequantize the weights first
+#define WEBGPU_MUL_MAT_PVR_GEMM_MIN_N 32u
+// Columns up to which mul_mat_vec_pvr.wgsl takes them all at once
+#define WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS 8u
+
+// texture rows holding m x k dequantized weights (8 per texel)
+static uint32_t ggml_webgpu_pvr_dequant_rows(uint64_t m, uint64_t k) {
+    return (uint32_t) CEIL_DIV(m * (k / 8), WEBGPU_MUL_MAT_PVR_TEX_W);
+}
+
+// Whether shaders of wg_size threads can place threads by subgroup and lane
+// (as mul_mat_vec_pvr.wgsl and flash_attn_pvr_mq.wgsl do, to pair lanes in
+// shuffles) with groups of up to min_lanes neighbouring lanes: every
+// subgroup size the device may pick divides wg_size and holds min_lanes.
+static bool ggml_webgpu_pvr_subgroups_tile(const webgpu_global_context & global_ctx, uint32_t wg_size, uint32_t min_lanes) {
+    const webgpu_capabilities & caps = global_ctx->capabilities;
+    return caps.supports_subgroups && caps.min_subgroup_size >= min_lanes && caps.max_subgroup_size > 0 &&
+           (caps.min_subgroup_size & (caps.min_subgroup_size - 1)) == 0 && wg_size % caps.max_subgroup_size == 0;
+}
+
+// mul_mat_vec_pvr.wgsl adds up a row's lanes (up to 8, neighbours) with subgroup shuffles
+static bool ggml_webgpu_mul_mat_vec_pvr_subgroups(const webgpu_global_context & global_ctx) {
+    return ggml_webgpu_pvr_subgroups_tile(global_ctx, WEBGPU_MUL_MAT_VEC_PVR_WG_SIZE, 8);
+}
+
+static bool ggml_webgpu_mul_mat_pvr_use_gemm(webgpu_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+    return src1->ne[1] >= WEBGPU_MUL_MAT_PVR_GEMM_MIN_N &&
+           ggml_webgpu_pvr_dequant_rows(src0->ne[1], src0->ne[0]) <=
+               ctx->global_ctx->capabilities.limits.maxTextureDimension2D &&
+           WEBGPU_MUL_MAT_PVR_TEX_W <= ctx->global_ctx->capabilities.limits.maxTextureDimension2D;
+}
+
+static bool ggml_webgpu_can_use_mul_mat_pvr(webgpu_context &    ctx,
+                                            const ggml_tensor * src0,
+                                            const ggml_tensor * src1,
+                                            const ggml_tensor * dst) {
+    if (!ggml_webgpu_is_pvr(ctx->global_ctx)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K) {
+        return false;
+    }
+    // mul_mat_pvr.wgsl reads each weight once per 16 columns, which is slow
+    // through a read_write binding: leave weights sharing dst's buffer to the
+    // generic shaders, unless they are dequantized first (only the dequantize
+    // shader reads them, and it writes elsewhere)
+    if (src1->ne[1] > 1 && ggml_webgpu_tensor_buf(src0).Get() == ggml_webgpu_tensor_buf(dst).Get() &&
+        !ggml_webgpu_mul_mat_pvr_use_gemm(ctx, src0, src1) && !ggml_webgpu_pvr_is_repacked(src0)) {
+        return false;
+    }
+    const size_t staged_bytes = (size_t) src1->ne[0] * src1->ne[1] * sizeof(float);
+    return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[0] % 256 == 0 &&
+           src1->nb[0] == ggml_type_size(src1->type) && src0->nb[0] == ggml_type_size(src0->type) &&
+           dst->nb[0] == ggml_type_size(dst->type) && dst->nb[1] == dst->ne[0] * ggml_type_size(dst->type) &&
+           src1->ne[1] <= ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension &&
+           staged_bytes <= ctx->global_ctx->capabilities.limits.maxStorageBufferBindingSize;
+}
+
+// The weights' offset (blocks from the binding) and row stride as the PowerVR
+// product shaders take them: for repacked weights (layout A, bound at their
+// start), 0 and the number of rows.
+static uint32_t ggml_webgpu_pvr_src0_offset(webgpu_context & ctx, const ggml_tensor * src0) {
+    if (ggml_webgpu_pvr_is_repacked(src0)) {
+        GGML_ASSERT(ggml_webgpu_tensor_misalignment(ctx, src0) == 0);
+        return 0;
+    }
+    return (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type));
+}
+
+static uint32_t ggml_webgpu_pvr_src0_stride(const ggml_tensor * src0) {
+    return ggml_webgpu_pvr_is_repacked(src0) ? (uint32_t) src0->ne[1] : (uint32_t) (src0->nb[1] / ggml_type_size(src0->type));
+}
+
+// Grows one of the PowerVR scratch buffers to at least size bytes. Commands
+// already encoded keep the old buffer alive.
+static void ggml_webgpu_pvr_scratch(webgpu_context & ctx, wgpu::Buffer & buf, size_t & buf_size, size_t size,
+                                    const char * label) {
+    if (!buf || buf_size < size) {
+        buf_size = std::max<size_t>(size, 64 * 1024);
+        ggml_webgpu_create_buffer(ctx->global_ctx->device, buf, buf_size, wgpu::BufferUsage::Storage, label);
+    }
+}
+
+// Whether the staging buffer holds src1 (f32, or f16 for the GEMM) already.
+static bool ggml_webgpu_pvr_is_staged(webgpu_context & ctx, const ggml_tensor * src1, bool f16) {
+    const ggml_tensor * staged = ctx->pvr_staged_src1;
+    return staged != nullptr && ctx->pvr_staged_f16 == f16 &&
+           ggml_webgpu_tensor_buf(staged).Get() == ggml_webgpu_tensor_buf(src1).Get() &&
+           ggml_webgpu_tensor_offset(staged) == ggml_webgpu_tensor_offset(src1) && staged->ne[0] == src1->ne[0] &&
+           staged->ne[1] == src1->ne[1] && (src1->ne[1] == 1 || staged->nb[1] == src1->nb[1]);
+}
+
+// Switches to the other staging buffer, of at least size bytes, for writing
+// the next src1 (the current one may still be read by the op writing it).
+static void ggml_webgpu_pvr_stage_next(webgpu_context & ctx, size_t size) {
+    const int next = ctx->pvr_staged_idx ^ 1;
+    ggml_webgpu_pvr_scratch(ctx, ctx->pvr_staging_buf[next], ctx->pvr_staging_size[next], size, "pvr_staging_buf");
+    ctx->pvr_staged_idx  = next;
+    ctx->pvr_staged_src1 = nullptr;
+}
+
+// Matrix products on PowerVR: copy src1 into the staging buffer (f32, or f16
+// for mul_mat_pvr_gemm.wgsl), then multiply from read-only bindings.
+// glu_other: SwiGLU fused in (mul_mat_pvr_gemm.wgsl, GLU), dst then being
+// the GLU's output and glu_other its other operand; glu_mm_is_gate says
+// which operand the product is.
+static webgpu_encoded_op ggml_webgpu_mul_mat_pvr(webgpu_context & ctx,
+                                                 ggml_tensor *    src0,
+                                                 ggml_tensor *    src1,
+                                                 ggml_tensor *    dst,
+                                                 ggml_tensor *    glu_other      = nullptr,
+                                                 bool             glu_mm_is_gate = false) {
+    const uint32_t k            = (uint32_t) src0->ne[0];
+    const uint32_t m            = (uint32_t) dst->ne[0];
+    const uint32_t n            = (uint32_t) src1->ne[1];
+    const bool     gemm         = ggml_webgpu_mul_mat_pvr_use_gemm(ctx, src0, src1);
+    const size_t   staged_bytes = ROUNDUP_POW2((size_t) k * n * (gemm ? sizeof(ggml_fp16_t) : sizeof(float)), 16);
+
+    std::vector<webgpu_dispatch_desc> dispatches;
+
+    const bool reuse_staged = ggml_webgpu_pvr_is_staged(ctx, src1, gemm);
+    if (!reuse_staged) {
+        ggml_webgpu_pvr_stage_next(ctx, staged_bytes);
+    }
+    ctx->pvr_staged_src1 = src1;
+    ctx->pvr_staged_f16  = gemm;
+    wgpu::Buffer & staging_buf = ctx->pvr_staging_buf[ctx->pvr_staged_idx];
+
+    // 1. copy src1 into the staging buffer
+    if (!reuse_staged) {
+        webgpu_pipeline       stage_pipeline = ctx->shader_lib->get_mul_mat_pvr_stage_pipeline(gemm);
+        std::vector<uint32_t> stage_params   = {
+            (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type)),
+            k,
+            (uint32_t) (src1->nb[1] / ggml_type_size(src1->type)),
+            n,
+        };
+        std::vector<wgpu::BindGroupEntry> stage_entries = {
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src1),
+            ggml_webgpu_make_bind_group_entry(1, staging_buf, 0, staged_bytes),
+        };
+        // the f16 copy converts a pair of values per thread
+        const uint32_t per_column = gemm ? k / 2 : k;
+        dispatches.push_back({
+            stage_pipeline, std::move(stage_params), std::move(stage_entries),
+            { CEIL_DIV(per_column, WEBGPU_MUL_MAT_PVR_STAGE_WG_SIZE), n }
+        });
+    }
+
+    if (gemm) {
+        // 2. the weights to f16, read-only as only this shader reads them
+        const uint32_t rows = ggml_webgpu_pvr_dequant_rows(m, k);
+        if (!ctx->pvr_dequant_tex || ctx->pvr_dequant_rows < rows) {
+            // commands already encoded keep the old texture alive
+            ctx->pvr_dequant_rows = rows;
+            wgpu::TextureDescriptor desc;
+            desc.label         = "pvr_dequant_tex";
+            desc.usage         = wgpu::TextureUsage::StorageBinding | wgpu::TextureUsage::TextureBinding;
+            desc.dimension     = wgpu::TextureDimension::e2D;
+            desc.size          = { WEBGPU_MUL_MAT_PVR_TEX_W, rows, 1 };
+            desc.format        = wgpu::TextureFormat::RGBA32Uint;
+            desc.mipLevelCount = 1;
+            desc.sampleCount   = 1;
+            ctx->pvr_dequant_tex  = ctx->global_ctx->device.CreateTexture(&desc);
+            ctx->pvr_dequant_view = ctx->pvr_dequant_tex.CreateView();
+        }
+        wgpu::BindGroupEntry tex_entry = {};
+        tex_entry.binding              = 1;
+        tex_entry.textureView          = ctx->pvr_dequant_view;
+        uint32_t wg_x = 1;
+        uint32_t wg_y = 1;
+        // (repacked weights: a workgroup per block column of WG_SIZE / 32 rows)
+        const uint32_t dequant_wg =
+            ggml_webgpu_pvr_is_repacked(src0) ?
+                CEIL_DIV(m, WEBGPU_MUL_MAT_PVR_DEQUANT_WG_SIZE / 32) * (k / 256) :
+                CEIL_DIV(m * (k / 8), WEBGPU_MUL_MAT_PVR_DEQUANT_WG_SIZE);
+        compute_2d_workgroups(dequant_wg,
+                              ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+        dispatches.push_back({
+            ctx->shader_lib->get_mul_mat_pvr_dequant_pipeline(src0->type, ggml_webgpu_pvr_is_repacked(src0)),
+            { ggml_webgpu_pvr_src0_offset(ctx, src0), ggml_webgpu_pvr_src0_stride(src0), m, k },
+            { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0), tex_entry },
+            { wg_x, wg_y }
+        });
+
+        // 3. the product
+        tex_entry.binding = 0;
+        compute_2d_workgroups(CEIL_DIV(m, WEBGPU_MUL_MAT_PVR_GEMM_ROWS) * CEIL_DIV(n, WEBGPU_MUL_MAT_PVR_GEMM_COLS),
+                              ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+        std::vector<wgpu::BindGroupEntry> gemm_entries = {
+            tex_entry, ggml_webgpu_make_bind_group_entry(1, staging_buf, 0, staged_bytes),
+            ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst)
+        };
+        uint32_t offset_glu = 0;
+        if (glu_other != nullptr) {
+            gemm_entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, glu_other));
+            offset_glu = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, glu_other) / ggml_type_size(glu_other->type));
+        }
+        dispatches.push_back({
+            ctx->shader_lib->get_mul_mat_pvr_gemm_pipeline(glu_other == nullptr ? 0 : (glu_mm_is_gate ? 2 : 1)),
+            { (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)), m, n, k, offset_glu },
+            std::move(gemm_entries), { wg_x, wg_y }
+        });
+        return ggml_backend_webgpu_build_multi(ctx, dispatches);
+    }
+
+    // 2. the product, with the weights read-only unless they share dst's buffer
+    const bool      src0_ro = ggml_webgpu_tensor_buf(src0).Get() != ggml_webgpu_tensor_buf(dst).Get();
+    webgpu_pipeline pipeline;
+    uint32_t        total_wg;
+    if (n <= WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS) {
+        // one column, or a few (a speculative batch, the end of a prompt) read against the weights once
+        const uint32_t ncol = n;
+        const bool     sg   = ggml_webgpu_mul_mat_vec_pvr_subgroups(ctx->global_ctx);
+        pipeline            = ctx->shader_lib->get_mul_mat_vec_pvr_pipeline(
+            src0->type, src0_ro, ncol, sg, {},
+            ggml_webgpu_shader_lib::ggml_webgpu_mul_mat_vec_pvr_choose_shape(src0->type, ggml_webgpu_pvr_is_repacked(src0),
+                                                                             ncol, m, sg, {}));
+        auto * decisions = static_cast<ggml_webgpu_mul_mat_vec_shader_decisions *>(pipeline.context.get());
+        total_wg         = CEIL_DIV(m, decisions->outputs_per_wg);
+    } else {
+        pipeline = ctx->shader_lib->get_mul_mat_pvr_pipeline(src0->type, src0_ro, ggml_webgpu_pvr_is_repacked(src0));
+        total_wg = CEIL_DIV(m, WEBGPU_MUL_MAT_PVR_TILE) * CEIL_DIV(n, WEBGPU_MUL_MAT_PVR_TILE);
+    }
+
+    std::vector<uint32_t> params = { ggml_webgpu_pvr_src0_offset(ctx, src0),
+                                     0u,
+                                     (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+                                     m,
+                                     n,
+                                     k,
+                                     ggml_webgpu_pvr_src0_stride(src0),
+                                     k,
+                                     0u,
+                                     0u,
+                                     0u,
+                                     0u,
+                                     1u,
+                                     1u,
+                                     1u,
+                                     1u };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0),
+        ggml_webgpu_make_bind_group_entry(1, staging_buf, 0, staged_bytes),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst),
+    };
+    uint32_t wg_x = 1;
+    uint32_t wg_y = 1;
+    compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    dispatches.push_back({
+        pipeline, std::move(params), std::move(entries), { wg_x, wg_y }
+    });
+
+    return ggml_backend_webgpu_build_multi(ctx, dispatches);
+}
+
+// Whether the PowerVR mat-vec (mul_mat_vec_pvr.wgsl) takes this product.
+static bool ggml_webgpu_mul_mat_vec_pvr_applies(webgpu_context &    ctx,
+                                                const ggml_tensor * src0,
+                                                const ggml_tensor * src1,
+                                                const ggml_tensor * dst) {
+    return ggml_webgpu_can_use_mul_mat_pvr(ctx, src0, src1, dst) && src1->ne[1] <= WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS &&
+           !ggml_webgpu_mul_mat_pvr_use_gemm(ctx, src0, src1) && ggml_webgpu_tensor_buf(src0).Get() != ggml_webgpu_tensor_buf(dst).Get();
+}
+
+// The PowerVR mat-vec with the next op(s) fused in, to save dispatches (each
+// costs tens of microseconds there): fuse.add, dst = product + add (the
+// residual, after the attention, conv or FFN output); fuse.glu, dst =
+// SwiGLU(product with src0, product with src0b), the FFN's gate and up,
+// with fuse.stage_out also writing dst into the other staging buffer for
+// the down product. Each column's arithmetic is the separate ops'.
+static webgpu_encoded_op ggml_webgpu_mul_mat_vec_pvr_fused(webgpu_context &                                      ctx,
+                                                           ggml_tensor *                                         src0,
+                                                           ggml_tensor *                                         src0b,
+                                                           ggml_tensor *                                         src1,
+                                                           ggml_tensor *                                         add,
+                                                           ggml_tensor *                                         dst,
+                                                           const ggml_webgpu_mul_mat_vec_pvr_fusion & fuse) {
+    const uint32_t k            = (uint32_t) src0->ne[0];
+    const uint32_t m            = (uint32_t) dst->ne[0];
+    const uint32_t n            = (uint32_t) src1->ne[1];
+    const size_t   staged_bytes = ROUNDUP_POW2((size_t) k * n * sizeof(float), 16);
+
+    std::vector<webgpu_dispatch_desc> dispatches;
+    if (!ggml_webgpu_pvr_is_staged(ctx, src1, false)) {
+        ggml_webgpu_pvr_stage_next(ctx, staged_bytes);
+        wgpu::Buffer & staging_buf = ctx->pvr_staging_buf[ctx->pvr_staged_idx];
+        dispatches.push_back({
+            ctx->shader_lib->get_mul_mat_pvr_stage_pipeline(false),
+            { (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type)), k,
+              (uint32_t) (src1->nb[1] / ggml_type_size(src1->type)), n },
+            { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src1),
+              ggml_webgpu_make_bind_group_entry(1, staging_buf, 0, staged_bytes) },
+            { CEIL_DIV(k, WEBGPU_MUL_MAT_PVR_STAGE_WG_SIZE), n }
+        });
+    }
+    ctx->pvr_staged_src1 = src1;
+    ctx->pvr_staged_f16  = false;
+    const int src1_idx   = ctx->pvr_staged_idx;
+
+    const bool      sg       = ggml_webgpu_mul_mat_vec_pvr_subgroups(ctx->global_ctx);
+    webgpu_pipeline pipeline = ctx->shader_lib->get_mul_mat_vec_pvr_pipeline(
+        src0->type, true, n, sg, fuse,
+        ggml_webgpu_shader_lib::ggml_webgpu_mul_mat_vec_pvr_choose_shape(src0->type, ggml_webgpu_pvr_is_repacked(src0), n,
+                                                                         m, sg, fuse));
+    auto * decisions = static_cast<ggml_webgpu_mul_mat_vec_shader_decisions *>(pipeline.context.get());
+
+    std::vector<uint32_t> params = {
+        ggml_webgpu_pvr_src0_offset(ctx, src0),
+        0u,
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        m,
+        n,
+        k,
+        ggml_webgpu_pvr_src0_stride(src0),
+        k,
+        // stride_02: src0b's offset (GLU)
+        src0b ? ggml_webgpu_pvr_src0_offset(ctx, src0b) : 0u,
+        // stride_12: add's offset (ADD)
+        add && !fuse.add_in_dst ? (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, add) / ggml_type_size(add->type)) : 0u,
+        0u,
+        0u,
+        1u,
+        1u,
+        1u,
+        1u
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0),
+        ggml_webgpu_make_bind_group_entry(1, ctx->pvr_staging_buf[src1_idx], 0, staged_bytes),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst),
+    };
+    // the fused-in bindings follow dst in this order (see mul_mat_vec_pvr.wgsl)
+    if (fuse.add && !fuse.add_in_dst) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, entries.size(), add));
+    }
+    if (fuse.glu) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, entries.size(), src0b));
+    }
+    if (fuse.stage_out) {
+        // dst, packed, becomes the staged src1 of the next product
+        const size_t out_bytes = ROUNDUP_POW2((size_t) m * n * sizeof(float), 16);
+        ggml_webgpu_pvr_stage_next(ctx, out_bytes);
+        entries.push_back(ggml_webgpu_make_bind_group_entry(entries.size(), ctx->pvr_staging_buf[ctx->pvr_staged_idx], 0, out_bytes));
+        ctx->pvr_staged_src1  = dst;
+        ctx->pvr_staged_f16   = false;
+        ctx->pvr_staged_by_op = true;
+    }
+    uint32_t wg_x = 1;
+    uint32_t wg_y = 1;
+    compute_2d_workgroups(CEIL_DIV(m, decisions->outputs_per_wg),
+                          ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    dispatches.push_back({ pipeline, std::move(params), std::move(entries), { wg_x, wg_y } });
+    return ggml_backend_webgpu_build_multi(ctx, dispatches);
+}
+
+// A product (PowerVR mat-vec) followed by an ADD of it and another tensor
+// of its shape: returns the other tensor, or nullptr when they can't fuse.
+// in_dst: the other tensor is the ADD's output itself (computed in place).
+static ggml_tensor * ggml_webgpu_mul_mat_pvr_add_operand(webgpu_context &           ctx,
+                                                         const struct ggml_cgraph * cgraph,
+                                                         int                        node_idx,
+                                                         bool &                     in_dst) {
+    if (!ggml_webgpu_is_pvr(ctx->global_ctx) || !ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+        return nullptr;
+    }
+    ggml_tensor * mm  = cgraph->nodes[node_idx];
+    ggml_tensor * add = cgraph->nodes[node_idx + 1];
+    if (!ggml_webgpu_mul_mat_vec_pvr_applies(ctx, mm->src[0], mm->src[1], mm)) {
+        return nullptr;
+    }
+    ggml_tensor * other = add->src[0] == mm ? add->src[1] : add->src[0];
+    if ((add->src[0] != mm && add->src[1] != mm) || other == mm) {
+        return nullptr;
+    }
+    if (other->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || !ggml_are_same_shape(other, mm) ||
+        !ggml_are_same_shape(add, mm) || !ggml_is_contiguous(other) || !ggml_is_contiguous(add) ||
+        ggml_webgpu_tensor_buf(mm->src[0]).Get() == ggml_webgpu_tensor_buf(add).Get()) {
+        return nullptr;
+    }
+    in_dst = false;
+    if (ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, other, add)) {
+        // computed in place: read the operand through dst's binding
+        if (ggml_webgpu_tensor_buf(other).Get() != ggml_webgpu_tensor_buf(add).Get() ||
+            ggml_webgpu_tensor_offset(other) != ggml_webgpu_tensor_offset(add)) {
+            return nullptr;
+        }
+        in_dst = true;
+    }
+    return other;
+}
+
+// The FFN's gate and up products (PowerVR mat-vecs of one src1) followed by
+// the SwiGLU of the two: returns the GLU node's index offset (2), and sets
+// gate and up, or returns 0 when they can't fuse.
+static int ggml_webgpu_mul_mat_pvr_glu_nodes(webgpu_context &           ctx,
+                                             const struct ggml_cgraph * cgraph,
+                                             int                        node_idx,
+                                             ggml_tensor *&             gate,
+                                             ggml_tensor *&             up) {
+    if (!ggml_webgpu_is_pvr(ctx->global_ctx)) {
+        return 0;
+    }
+    const enum ggml_op ops[3]  = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+    const int          out_idx = node_idx + 2;
+    // the two products are only read by the GLU
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 3, ops, &out_idx, 1)) {
+        return 0;
+    }
+    ggml_tensor * mm0 = cgraph->nodes[node_idx];
+    ggml_tensor * mm1 = cgraph->nodes[node_idx + 1];
+    ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return 0;
+    }
+    if (!((glu->src[0] == mm0 && glu->src[1] == mm1) || (glu->src[0] == mm1 && glu->src[1] == mm0))) {
+        return 0;
+    }
+    gate = glu->src[0];
+    up   = glu->src[1];
+    if (mm0->src[1] != mm1->src[1] && !(ggml_webgpu_tensor_buf(mm0->src[1]).Get() == ggml_webgpu_tensor_buf(mm1->src[1]).Get() &&
+                                        ggml_webgpu_tensor_offset(mm0->src[1]) == ggml_webgpu_tensor_offset(mm1->src[1]) &&
+                                        ggml_are_same_shape(mm0->src[1], mm1->src[1]) && mm0->src[1]->nb[1] == mm1->src[1]->nb[1])) {
+        return 0;
+    }
+    if (gate->src[0]->type != up->src[0]->type || !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+        gate->src[0]->nb[1] != up->src[0]->nb[1] ||
+        ggml_webgpu_pvr_is_repacked(gate->src[0]) != ggml_webgpu_pvr_is_repacked(up->src[0]) ||
+        !ggml_webgpu_mul_mat_vec_pvr_applies(ctx, gate->src[0], gate->src[1], gate) ||
+        !ggml_webgpu_mul_mat_vec_pvr_applies(ctx, up->src[0], up->src[1], up)) {
+        return 0;
+    }
+    if (glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(glu, gate) || !ggml_is_contiguous(glu) ||
+        ggml_webgpu_tensor_buf(gate->src[0]).Get() == ggml_webgpu_tensor_buf(glu).Get()) {
+        return 0;
+    }
+    return 2;
+}
+
+// A prompt batch's FFN on PowerVR: the gate or up product followed by the
+// SwiGLU that takes it and the other one (already computed). The product's
+// shader applies the SwiGLU instead of writing its result, which saves
+// writing and reading back two activations as large as the FFN, and buffer
+// writes are slow there.
+static bool ggml_webgpu_can_fuse_mul_mat_pvr_swiglu(webgpu_context &           ctx,
+                                                    const struct ggml_cgraph * cgraph,
+                                                    int                        node_idx) {
+    if (!ggml_webgpu_is_pvr(ctx->global_ctx) || !ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+        return false;
+    }
+    ggml_tensor * mm  = cgraph->nodes[node_idx];
+    ggml_tensor * glu = cgraph->nodes[node_idx + 1];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;  // not split, or swapped
+    }
+    ggml_tensor * other = glu->src[0] == mm ? glu->src[1] : glu->src[0];
+    if (glu->src[0] != mm && glu->src[1] != mm) {
+        return false;
+    }
+    if (!ggml_webgpu_can_use_mul_mat_pvr(ctx, mm->src[0], mm->src[1], mm) ||
+        !ggml_webgpu_mul_mat_pvr_use_gemm(ctx, mm->src[0], mm->src[1])) {
+        return false;
+    }
+    // the other operand and the output laid out as the product, the output
+    // bound apart from the other operand
+    return other->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 && ggml_are_same_shape(other, mm) &&
+           ggml_are_same_shape(glu, mm) && ggml_is_contiguous(other) && ggml_is_contiguous(glu) &&
+           !ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, other, glu);
+}
+
 static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
                                              ggml_tensor *    src0,
                                              ggml_tensor *    src1,
                                              ggml_tensor *    dst) {
+    if (ggml_webgpu_can_use_mul_mat_pvr(ctx, src0, src1, dst)) {
+        return ggml_webgpu_mul_mat_pvr(ctx, src0, src1, dst);
+    }
+    // only the PowerVR shaders read repacked weights (supports_op keeps the others away)
+    GGML_ASSERT(!ggml_webgpu_pvr_is_repacked(src0));
+    ctx->pvr_staged_src1 = nullptr;
+
+    // PowerVR: a product of 2 to 8 columns (a speculative batch) that the PowerVR shaders don't take
+    // (weights of other types) runs as one-column products, so that each column's arithmetic is the
+    // one-token decode's: the generic shaders' batched paths sum in other orders, and speculative
+    // decoding would then write other text than decoding one token at a time
+    if (ggml_webgpu_is_pvr(ctx->global_ctx) && dst->ne[1] >= 2 && dst->ne[1] <= WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS &&
+        dst->ne[2] == 1 && dst->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[2] == 1 &&
+        src0->ne[3] == 1) {
+        if (!ctx->pvr_split_logged) {
+            ctx->pvr_split_logged = true;
+            GGML_LOG_INFO("ggml_webgpu: PowerVR: %s products of 2 to %u columns run a column at a time\n",
+                          ggml_type_name(src0->type), WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS);
+        }
+        webgpu_encoded_op result = {};
+        for (int64_t c = 0; c < dst->ne[1]; c++) {
+            // column c of src1 and dst, as views
+            ggml_tensor src1_c = *src1;
+            ggml_tensor dst_c  = *dst;
+            for (auto [view, t] : { std::pair<ggml_tensor *, ggml_tensor *>{ &src1_c, src1 }, { &dst_c, dst } }) {
+                view->view_src  = t->view_src ? t->view_src : t;
+                view->view_offs = t->view_offs + c * t->nb[1];
+                view->ne[1]     = 1;
+            }
+            webgpu_encoded_op op = ggml_webgpu_mul_mat(ctx, src0, &src1_c, &dst_c);
+            // (the PowerVR shaders, which take a column of weights that share dst's buffer, note the
+            // staged src1 by pointer: the next column's view is another tensor at that address)
+            ctx->pvr_staged_src1 = nullptr;
+            result.num_kernels += op.num_kernels;
+#ifdef GGML_WEBGPU_GPU_PROFILE
+            result.pipeline_names.insert(result.pipeline_names.end(), op.pipeline_names.begin(),
+                                         op.pipeline_names.end());
+#endif
+        }
+        return result;
+    }
+
     // Determine if this is a mat-vec operation
     bool use_mat_vec = (dst->ne[1] <= GGML_WEBGPU_MUL_MAT_VEC_MAX_ROWS);
 
@@ -2333,6 +3054,171 @@ static webgpu_encoded_op ggml_webgpu_flash_attn_vec(webgpu_context &          ct
     return ggml_backend_webgpu_build_multi(ctx, dispatches);
 }
 
+// One query token on PowerVR, or a few: flash_attn_pvr.wgsl, as the vector
+// path takes milliseconds per call there.
+#define WEBGPU_FLASH_ATTN_PVR_VEC_MAX_ROWS 8
+static bool ggml_webgpu_can_use_flash_attn_pvr(webgpu_context &    ctx,
+                                               const ggml_tensor * Q,
+                                               const ggml_tensor * K,
+                                               const ggml_tensor * V,
+                                               const ggml_tensor * mask,
+                                               const ggml_tensor * sinks,
+                                               const ggml_tensor * dst) {
+    if (!ggml_webgpu_is_pvr(ctx->global_ctx)) {
+        return false;
+    }
+    const int64_t head_dim = Q->ne[0];
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+        dst->type != GGML_TYPE_F32 || sinks != nullptr || Q->ne[3] != 1 || K->ne[3] != 1 ||
+        V->ne[3] != 1 || V->ne[0] != head_dim || K->ne[0] != head_dim || head_dim % 4 != 0 || head_dim > 256 ||
+        Q->ne[2] % K->ne[2] != 0 || K->ne[2] != V->ne[2] || K->ne[1] != V->ne[1] || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (ggml_get_op_params_f32(dst, 1) != 0.0f || ggml_get_op_params_f32(dst, 2) != 0.0f) {
+        return false;  // ALiBi, logit softcap
+    }
+    if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+                            mask->nb[0] != 2 || mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1])) {
+        return false;
+    }
+    if (Q->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // its workgroup memory must fit (see ggml_webgpu_flash_attn_pvr_wg_size)
+    if (ggml_webgpu_flash_attn_pvr_wg_size((uint32_t) head_dim,
+                                           ctx->global_ctx->capabilities.limits.maxComputeWorkgroupStorageSize) == 0) {
+        return false;
+    }
+    // K and V bound read_write (when one shares dst's buffer) must not overlap
+    const WGPUBuffer dst_buf = ggml_webgpu_tensor_buf(dst).Get();
+    if ((ggml_webgpu_tensor_buf(K).Get() == dst_buf || ggml_webgpu_tensor_buf(V).Get() == dst_buf) &&
+        ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, K, V)) {
+        return false;
+    }
+    // K and V are read through vec4<f16>
+    const size_t k_off = ggml_webgpu_tensor_misalignment(ctx, K) / ggml_type_size(K->type);
+    const size_t v_off = ggml_webgpu_tensor_misalignment(ctx, V) / ggml_type_size(V->type);
+    if (K->nb[0] != 2 || V->nb[0] != 2 || k_off % 4 != 0 || v_off % 4 != 0 || (K->nb[1] / 2) % 4 != 0 ||
+        (K->nb[2] / 2) % 4 != 0 || (V->nb[1] / 2) % 4 != 0 || (V->nb[2] / 2) % 4 != 0) {
+        return false;
+    }
+    return true;
+}
+
+static webgpu_encoded_op ggml_webgpu_flash_attn_pvr(webgpu_context & ctx,
+                                                    ggml_tensor *    Q,
+                                                    ggml_tensor *    K,
+                                                    ggml_tensor *    V,
+                                                    ggml_tensor *    mask,
+                                                    ggml_tensor *    dst) {
+    const uint32_t   head_dim = (uint32_t) Q->ne[0];
+    const WGPUBuffer dst_buf  = ggml_webgpu_tensor_buf(dst).Get();
+    const bool kv_ro = ggml_webgpu_tensor_buf(K).Get() != dst_buf && ggml_webgpu_tensor_buf(V).Get() != dst_buf;
+    webgpu_pipeline pipeline = ctx->shader_lib->get_flash_attn_pvr_pipeline(
+        head_dim, mask != nullptr, kv_ro, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupStorageSize);
+
+    std::vector<uint32_t> params = {
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, Q) / ggml_type_size(Q->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, K) / ggml_type_size(K->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, V) / ggml_type_size(V->type)),
+        mask != nullptr ? (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, mask) / ggml_type_size(mask->type)) : 0u,
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        (uint32_t) K->ne[1],
+        (uint32_t) (Q->nb[2] / ggml_type_size(Q->type)),
+        (uint32_t) (K->nb[1] / ggml_type_size(K->type)),
+        (uint32_t) (K->nb[2] / ggml_type_size(K->type)),
+        (uint32_t) (V->nb[1] / ggml_type_size(V->type)),
+        (uint32_t) (V->nb[2] / ggml_type_size(V->type)),
+        (uint32_t) (Q->ne[2] / K->ne[2]),
+        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        (uint32_t) (Q->nb[1] / ggml_type_size(Q->type)),
+        mask != nullptr ? (uint32_t) (mask->nb[1] / ggml_type_size(mask->type)) : 0u,
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, Q),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, K),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, V),
+    };
+    if (mask != nullptr) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, mask));
+    }
+    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, mask != nullptr ? 4 : 3, dst));
+    // a workgroup per query token and head
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, (uint32_t) Q->ne[1], (uint32_t) Q->ne[2]);
+}
+
+// Several query rows (prompt batches) on PowerVR: flash_attn_pvr_mq.wgsl,
+// which reads K and V 8 values at a time. Returns the threads per row it
+// splits a row's head_dim over (subgroup shuffles add up their scores), or 0
+// when it can't take the op. Each thread keeps head_dim / split values of Q
+// and of the output in registers.
+static uint32_t ggml_webgpu_flash_attn_pvr_mq_split(webgpu_context &    ctx,
+                                                    const ggml_tensor * Q,
+                                                    const ggml_tensor * K,
+                                                    const ggml_tensor * V) {
+    const uint32_t head_dim = (uint32_t) Q->ne[0];
+    const size_t   k_off    = ggml_webgpu_tensor_misalignment(ctx, K) / ggml_type_size(K->type);
+    const size_t   v_off    = ggml_webgpu_tensor_misalignment(ctx, V) / ggml_type_size(V->type);
+    if (head_dim % 8 != 0 || k_off % 8 != 0 || v_off % 8 != 0 || (K->nb[1] / 2) % 8 != 0 || (K->nb[2] / 2) % 8 != 0 ||
+        (V->nb[1] / 2) % 8 != 0 || (V->nb[2] / 2) % 8 != 0) {
+        return 0;
+    }
+    if (head_dim % 32 == 0 && head_dim >= 128 && head_dim <= 256 &&
+        ggml_webgpu_pvr_subgroups_tile(ctx->global_ctx, WEBGPU_FLASH_ATTN_PVR_MQ_ROWS * 4, 4)) {
+        return 4;
+    }
+    if (head_dim % 16 == 0 && head_dim <= 128 &&
+        ggml_webgpu_pvr_subgroups_tile(ctx->global_ctx, WEBGPU_FLASH_ATTN_PVR_MQ_ROWS * 2, 2)) {
+        return 2;
+    }
+    return head_dim <= 64 ? 1 : 0;
+}
+
+static webgpu_encoded_op ggml_webgpu_flash_attn_pvr_mq(webgpu_context & ctx,
+                                                       ggml_tensor *    Q,
+                                                       ggml_tensor *    K,
+                                                       ggml_tensor *    V,
+                                                       ggml_tensor *    mask,
+                                                       ggml_tensor *    dst,
+                                                       uint32_t         split) {
+    const uint32_t   head_dim = (uint32_t) Q->ne[0];
+    const WGPUBuffer dst_buf  = ggml_webgpu_tensor_buf(dst).Get();
+    const bool kv_ro = ggml_webgpu_tensor_buf(K).Get() != dst_buf && ggml_webgpu_tensor_buf(V).Get() != dst_buf;
+    webgpu_pipeline pipeline =
+        ctx->shader_lib->get_flash_attn_pvr_mq_pipeline(head_dim, split, mask != nullptr, kv_ro);
+
+    std::vector<uint32_t> params = {
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, Q) / ggml_type_size(Q->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, K) / ggml_type_size(K->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, V) / ggml_type_size(V->type)),
+        mask != nullptr ? (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, mask) / ggml_type_size(mask->type)) : 0u,
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        (uint32_t) K->ne[1],
+        (uint32_t) Q->ne[1],
+        (uint32_t) Q->ne[2],
+        (uint32_t) (Q->nb[1] / ggml_type_size(Q->type)),
+        (uint32_t) (Q->nb[2] / ggml_type_size(Q->type)),
+        (uint32_t) (K->nb[1] / ggml_type_size(K->type)),
+        (uint32_t) (K->nb[2] / ggml_type_size(K->type)),
+        (uint32_t) (V->nb[1] / ggml_type_size(V->type)),
+        (uint32_t) (V->nb[2] / ggml_type_size(V->type)),
+        mask != nullptr ? (uint32_t) (mask->nb[1] / ggml_type_size(mask->type)) : 0u,
+        (uint32_t) (Q->ne[2] / K->ne[2]),
+        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, Q),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, K),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, V),
+    };
+    if (mask != nullptr) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, mask));
+    }
+    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, mask != nullptr ? 4 : 3, dst));
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries,
+                                     CEIL_DIV((uint32_t) Q->ne[1], WEBGPU_FLASH_ATTN_PVR_MQ_ROWS), (uint32_t) Q->ne[2]);
+}
+
 static webgpu_encoded_op ggml_webgpu_flash_attn(webgpu_context & ctx,
                                                 ggml_tensor *    Q,
                                                 ggml_tensor *    K,
@@ -2340,6 +3226,15 @@ static webgpu_encoded_op ggml_webgpu_flash_attn(webgpu_context & ctx,
                                                 ggml_tensor *    mask,
                                                 ggml_tensor *    sinks,
                                                 ggml_tensor *    dst) {
+    if (ggml_webgpu_can_use_flash_attn_pvr(ctx, Q, K, V, mask, sinks, dst)) {
+        // a few query tokens (a speculative batch, the end of a prompt) run faster as one-token problems
+        if (Q->ne[1] <= WEBGPU_FLASH_ATTN_PVR_VEC_MAX_ROWS) {
+            return ggml_webgpu_flash_attn_pvr(ctx, Q, K, V, mask, dst);
+        }
+        if (const uint32_t split = ggml_webgpu_flash_attn_pvr_mq_split(ctx, Q, K, V)) {
+            return ggml_webgpu_flash_attn_pvr_mq(ctx, Q, K, V, mask, dst, split);
+        }
+    }
     ggml_webgpu_flash_attn_op op = ggml_webgpu_flash_attn_prepare(ctx, Q, K, V, mask, sinks, dst);
     if (ggml_webgpu_flash_attn_use_vec_path(ctx->global_ctx, Q, K, V, Q->ne[1])) {
         return ggml_webgpu_flash_attn_vec(ctx, Q, K, V, mask, sinks, dst, std::move(op));
@@ -2670,6 +3565,127 @@ static webgpu_encoded_op ggml_webgpu_repeat(webgpu_context & ctx, ggml_tensor * 
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
+// PowerVR: a block's post-norm (RMS_NORM, MUL), the residual ADD and the next
+// norm (RMS_NORM, MUL) as one dispatch (see rms_norm_add_pvr.wgsl): models
+// with post-norms (LFM3) run this twice per layer, and every dispatch costs
+// tens of microseconds there. Few rows only (the next norm's output is staged
+// for a mat-vec). Fills the five nodes' tensors, or returns false.
+struct ggml_webgpu_pvr_post_norm {
+    ggml_tensor * o, * w1, * x, * a, * w2, * out;
+    float         eps1, eps2;
+};
+
+// Whether two tensors are the same bytes or apart (or in different buffers). A
+// fused op that writes one where a thread of another workgroup (row) may
+// still read the other is only race-free then: gallocr may place a tensor
+// over part of another, at a shift.
+static bool ggml_webgpu_pvr_same_or_apart(const ggml_tensor * a, const ggml_tensor * b) {
+    if (ggml_webgpu_tensor_buf(a).Get() != ggml_webgpu_tensor_buf(b).Get()) {
+        return true;
+    }
+    const size_t oa = ggml_webgpu_tensor_offset(a);
+    const size_t ob = ggml_webgpu_tensor_offset(b);
+    return (oa == ob && ggml_nbytes(a) == ggml_nbytes(b)) || oa + ggml_nbytes(a) <= ob || ob + ggml_nbytes(b) <= oa;
+}
+
+static bool ggml_webgpu_pvr_post_norm_nodes(webgpu_context &            ctx,
+                                            const struct ggml_cgraph * cgraph,
+                                            int                        node_idx,
+                                            ggml_webgpu_pvr_post_norm & f) {
+    if (!ggml_webgpu_is_pvr(ctx->global_ctx) ||
+        !ggml_can_fuse_subgraph(cgraph, node_idx,
+                                { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL },
+                                { node_idx + 2, node_idx + 4 })) {
+        return false;
+    }
+    ggml_tensor * n1  = cgraph->nodes[node_idx];
+    ggml_tensor * m1  = cgraph->nodes[node_idx + 1];
+    ggml_tensor * add = cgraph->nodes[node_idx + 2];
+    ggml_tensor * n2  = cgraph->nodes[node_idx + 3];
+    ggml_tensor * m2  = cgraph->nodes[node_idx + 4];
+    // the other operand of a binary op whose one operand is t
+    auto other = [](const ggml_tensor * op, const ggml_tensor * t) -> ggml_tensor * {
+        return op->src[0] == t ? op->src[1] : op->src[1] == t ? op->src[0] : nullptr;
+    };
+    f.o   = n1->src[0];
+    f.w1  = other(m1, n1);
+    f.x   = other(add, m1);
+    f.a   = add;
+    f.w2  = other(m2, n2);
+    f.out = m2;
+    if (!f.w1 || !f.x || !f.w2 || n2->src[0] != add) {
+        return false;
+    }
+    // rows of ne0 values, contiguous; the norms' weights one row each
+    const int64_t ne0 = f.o->ne[0];
+    for (const ggml_tensor * t : { f.o, f.x, f.a, f.out }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, f.o) ||
+            ggml_webgpu_tensor_buf(t).Get() != ggml_webgpu_tensor_buf(f.o).Get()) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : { n1, m1, n2 }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, f.o)) {
+            return false;
+        }
+    }
+    // (the weights bound read-only: not in the buffer bound read-write)
+    for (const ggml_tensor * t : { f.w1, f.w2 }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != ne0 || ggml_nrows(t) != 1 ||
+            ggml_webgpu_tensor_buf(t).Get() == ggml_webgpu_tensor_buf(f.o).Get()) {
+            return false;
+        }
+    }
+    if (f.o->ne[2] != 1 || f.o->ne[3] != 1 || f.o->ne[1] > WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS) {
+        return false;
+    }
+    // a column belongs to one thread throughout, so what it writes (a, out) may be what it reads (o, x)
+    // or apart from it, but not over another row's
+    for (const ggml_tensor * wr : { f.a, f.out }) {
+        for (const ggml_tensor * rd : { f.o, f.x, f.a }) {
+            if (wr != rd && !ggml_webgpu_pvr_same_or_apart(wr, rd)) {
+                return false;
+            }
+        }
+    }
+    f.eps1 = ggml_get_op_params_f32(n1, 0);
+    f.eps2 = ggml_get_op_params_f32(n2, 0);
+    return true;
+}
+
+static webgpu_encoded_op ggml_webgpu_pvr_rms_norm_add(webgpu_context & ctx, const ggml_webgpu_pvr_post_norm & f) {
+    const ggml_webgpu_merged_binding_range act = ggml_webgpu_tensor_merged_binding_range(ctx, { f.o, f.x, f.a, f.out });
+    std::vector<uint32_t> params = {
+        ggml_webgpu_tensor_merged_element_offset(f.o, act),
+        ggml_webgpu_tensor_merged_element_offset(f.x, act),
+        ggml_webgpu_tensor_merged_element_offset(f.a, act),
+        ggml_webgpu_tensor_merged_element_offset(f.out, act),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, f.w1) / sizeof(float)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, f.w2) / sizeof(float)),
+        (uint32_t) f.o->ne[0],
+        (uint32_t) ggml_nrows(f.o),
+        ggml_webgpu_u32_from_f32(f.eps1),
+        ggml_webgpu_u32_from_f32(f.eps2),
+    };
+    const size_t bytes = ROUNDUP_POW2(ggml_nbytes(f.out), 16);
+    ggml_webgpu_pvr_stage_next(ctx, bytes);
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_bind_group_entry(0, ggml_webgpu_tensor_buf(f.o), act.offset, act.size),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, f.w1),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, f.w2),
+        ggml_webgpu_make_bind_group_entry(3, ctx->pvr_staging_buf[ctx->pvr_staged_idx], 0, bytes),
+    };
+    ctx->pvr_staged_src1  = f.out;
+    ctx->pvr_staged_f16   = false;
+    ctx->pvr_staged_by_op = true;
+    webgpu_pipeline pipeline = ctx->shader_lib->get_rms_norm_add_pvr_pipeline(WEBGPU_PVR_RMS_NORM_MUL_WG_SIZE);
+    uint32_t        wg_x;
+    uint32_t        wg_y;
+    compute_2d_workgroups((uint32_t) ggml_nrows(f.o), ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension,
+                          wg_x, wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+}
+
 static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul(webgpu_context & ctx,
                                                                  ggml_tensor *    rn_src,
                                                                  ggml_tensor *    rn_dst,
@@ -2723,9 +3739,19 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul(webgpu_context 
     shader_lib_ctx.src1                           = mul_src;
     shader_lib_ctx.dst                            = dst;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    if (ggml_webgpu_is_pvr(ctx->global_ctx)) {
+        // a workgroup per row: PowerVR runs rows of a model's widths faster with fewer threads
+        shader_lib_ctx.max_wg_size = std::min(shader_lib_ctx.max_wg_size, WEBGPU_PVR_RMS_NORM_MUL_WG_SIZE);
+    }
 
-    const bool      src_overlap = ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, mul_src);
-    webgpu_pipeline pipeline    = ctx->shader_lib->get_rms_norm_mul_pipeline(shader_lib_ctx, src_overlap);
+    const bool src_overlap = ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, rn_src, mul_src);
+    // PowerVR: a norm's output on a few tokens is a mat-vec's src1, so write
+    // it into the staging buffer as well, which saves that copy's dispatch
+    const bool staged = ggml_webgpu_is_pvr(ctx->global_ctx) && !src_overlap && dst->type == GGML_TYPE_F32 &&
+                        dst->ne[1] <= WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+                        ggml_is_contiguous(dst) && !ggml_webgpu_tensor_equal(rn_src, dst) &&
+                        !ggml_webgpu_tensor_equal(mul_src, dst);
+    webgpu_pipeline pipeline = ctx->shader_lib->get_rms_norm_mul_pipeline(shader_lib_ctx, src_overlap, staged);
     auto *          decisions   = static_cast<ggml_webgpu_rms_norm_mul_shader_decisions *>(pipeline.context.get());
 
     if (decisions->src_overlap) {
@@ -2750,6 +3776,14 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_rms_norm_mul(webgpu_context 
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, rn_src));
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, mul_src));
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst));
+    }
+    if (staged) {
+        const size_t bytes = ROUNDUP_POW2(ggml_nbytes(dst), 16);
+        ggml_webgpu_pvr_stage_next(ctx, bytes);
+        entries.push_back(ggml_webgpu_make_bind_group_entry(3, ctx->pvr_staging_buf[ctx->pvr_staged_idx], 0, bytes));
+        ctx->pvr_staged_src1  = dst;
+        ctx->pvr_staged_f16   = false;
+        ctx->pvr_staged_by_op = true;
     }
 
     uint32_t wg_x;
@@ -3141,6 +4175,110 @@ static webgpu_encoded_op ggml_webgpu_argmax(webgpu_context & ctx, ggml_tensor * 
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x);
 }
 
+// PowerVR: the logits' top-k for the sampler (topk_pvr.wgsl), as llama.cpp
+// builds it: TOP_K, GET_ROWS of the logits at those indices, the indices
+// CPY'd to f32, and the two CONCAT'ed, in three dispatches that write the
+// CONCAT's output (each row: the k values largest first, then the indices).
+// The scratch space (group maxima, a count and the candidates of each row) is
+// a buffer of its own, so that the logits and then the scratch are bound
+// read-only.
+#define WEBGPU_TOPK_PVR_GPW   16u    // groups per stage 1 and 2 workgroup
+#define WEBGPU_TOPK_PVR_CAP   1792u  // candidates per row at most (the workgroup memory: 16 KB)
+#define WEBGPU_TOPK_PVR_G_MAX 2048u  // groups per row at most (stage 2 holds their maxima in workgroup memory)
+
+static uint32_t ggml_webgpu_topk_pvr_g_max(uint32_t n, uint32_t group) {
+    return ROUNDUP_POW2(CEIL_DIV(n, group), 8u);
+}
+
+// Values per group for rows of n values and the top k: 256, or fewer where
+// that leaves fewer than k whole groups (small vocabularies); 0 when none fits.
+static uint32_t ggml_webgpu_topk_pvr_group(uint64_t n, uint64_t k) {
+    for (uint32_t group : { 256u, 128u, 64u, 32u, 16u }) {
+        if (n / group >= k) {
+            return CEIL_DIV(n, (uint64_t) group) <= WEBGPU_TOPK_PVR_G_MAX ? group : 0;
+        }
+    }
+    return 0;
+}
+
+static webgpu_encoded_op ggml_webgpu_topk_pvr(webgpu_context & ctx,
+                                              ggml_tensor *    logits,
+                                              ggml_tensor *    topk,
+                                              ggml_tensor *    out) {
+    const uint32_t n     = (uint32_t) logits->ne[0];
+    const uint32_t k     = (uint32_t) topk->ne[0];
+    const uint32_t rows  = (uint32_t) logits->ne[1];
+    const uint32_t group = ggml_webgpu_topk_pvr_group(n, k);
+    GGML_ASSERT(group != 0);
+    const uint32_t n_wg  = CEIL_DIV(n, group * WEBGPU_TOPK_PVR_GPW);
+    const uint32_t g_max = ggml_webgpu_topk_pvr_g_max(n, group);
+    const size_t   scratch_size =
+        ROUNDUP_POW2((size_t) (g_max + 1 + 2 * WEBGPU_TOPK_PVR_CAP) * rows * sizeof(uint32_t), 16);
+    ggml_webgpu_pvr_scratch(ctx, ctx->pvr_topk_buf, ctx->pvr_topk_size, scratch_size, "pvr_topk_buf");
+    std::vector<uint32_t> params = {
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, logits) / sizeof(float)),
+        (uint32_t) (logits->nb[1] / sizeof(float)),
+        n,
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, out) / sizeof(float)),
+        (uint32_t) (out->nb[1] / sizeof(float)),
+    };
+    std::vector<webgpu_dispatch_desc> dispatches;
+    for (uint32_t stage = 1; stage <= 3; stage++) {
+        std::vector<wgpu::BindGroupEntry> entries;
+        if (stage < 3) {
+            entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, logits),
+                        ggml_webgpu_make_bind_group_entry(1, ctx->pvr_topk_buf, 0, scratch_size) };
+        } else {
+            entries = { ggml_webgpu_make_bind_group_entry(0, ctx->pvr_topk_buf, 0, scratch_size),
+                        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, out) };
+        }
+        dispatches.push_back({ ctx->shader_lib->get_topk_pvr_pipeline(stage, k, group, g_max, WEBGPU_TOPK_PVR_CAP),
+                               params, std::move(entries), stage < 3 ? std::make_pair(n_wg, rows) : std::make_pair(rows, 1u) });
+    }
+    return ggml_backend_webgpu_build_multi(ctx, dispatches);
+}
+
+// The CONCAT's index after the TOP_K at node_idx, if the nodes are the
+// logits' top-k as above (see ggml_webgpu_topk_pvr), or 0.
+static int ggml_webgpu_topk_pvr_fused_nodes(webgpu_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * topk = cgraph->nodes[node_idx];
+    const ggml_tensor * logits = topk->src[0];
+    if (!ggml_webgpu_is_pvr(ctx->global_ctx) || logits->type != GGML_TYPE_F32 || topk->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(logits) || logits->ne[2] != 1 || logits->ne[3] != 1 || topk->ne[0] > 256 ||
+        logits->ne[0] >= (1 << 24) || ggml_webgpu_topk_pvr_group(logits->ne[0], topk->ne[0]) == 0) {
+        return 0;
+    }
+    ggml_tensor * gr   = nullptr;
+    ggml_tensor * cast = nullptr;
+    for (int i = node_idx + 1; i < cgraph->n_nodes && i < node_idx + 8; i++) {
+        ggml_tensor * t = cgraph->nodes[i];
+        if (ggml_op_is_empty(t->op)) {
+            continue;
+        }
+        if (t->op == GGML_OP_GET_ROWS && gr == nullptr && t->src[1] == topk) {
+            // a [1, n, rows] view of the logits, read row by row
+            const ggml_tensor * v = t->src[0];
+            if ((v->view_src != logits && v != logits) || v->ne[0] != 1 || v->ne[1] != logits->ne[0] ||
+                v->ne[2] != logits->ne[1] || v->nb[1] != sizeof(float) || v->nb[2] != logits->nb[1] ||
+                v->type != GGML_TYPE_F32) {
+                return 0;
+            }
+            gr = t;
+        } else if (t->op == GGML_OP_CPY && cast == nullptr && t->src[0] == topk && t->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(t)) {
+            cast = t;
+        } else if (t->op == GGML_OP_CONCAT && gr != nullptr && cast != nullptr && t->type == GGML_TYPE_F32 &&
+                   ggml_get_op_params_i32(t, 0) == 0 && t->src[1] == cast && t->src[0]->view_src == gr &&
+                   ggml_is_contiguous(t) && t->ne[0] == 2 * topk->ne[0] && t->ne[1] == topk->ne[1] &&
+                   t->src[0]->ne[0] == topk->ne[0] && ggml_nelements(t->src[0]) == ggml_nelements(gr)) {
+            return i - node_idx;
+        } else {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static webgpu_encoded_op ggml_webgpu_argsort(webgpu_context & ctx, ggml_tensor * src, ggml_tensor * dst) {
     bool is_top_k = dst->op == GGML_OP_TOP_K;
 
@@ -3512,6 +4650,35 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         case GGML_OP_GET_ROWS:
             return ggml_webgpu_get_rows(ctx, src0, src1, node);
         case GGML_OP_MUL_MAT:
+            {
+                ggml_tensor * gate = nullptr;
+                ggml_tensor * up   = nullptr;
+                if (const int glu_at = ggml_webgpu_mul_mat_pvr_glu_nodes(ctx, cgraph, node_idx, gate, up)) {
+                    num_encoded_ops = glu_at + 1;
+                    ggml_webgpu_mul_mat_vec_pvr_fusion fuse;
+                    fuse.glu       = true;
+                    fuse.stage_out = true;
+                    return ggml_webgpu_mul_mat_vec_pvr_fused(ctx, gate->src[0], up->src[0], gate->src[1], nullptr,
+                                                             nodes[node_idx + glu_at], fuse);
+                }
+                bool in_dst = false;
+                if (ggml_tensor * other = ggml_webgpu_mul_mat_pvr_add_operand(ctx, cgraph, node_idx, in_dst)) {
+                    num_encoded_ops = 2;
+                    ggml_webgpu_mul_mat_vec_pvr_fusion fuse;
+                    fuse.add        = true;
+                    fuse.add_in_dst = in_dst;
+                    return ggml_webgpu_mul_mat_vec_pvr_fused(ctx, src0, nullptr, src1, other, nodes[node_idx + 1], fuse);
+                }
+            }
+            if (ggml_webgpu_can_fuse_mul_mat_pvr_swiglu(ctx, cgraph, node_idx)) {
+                num_encoded_ops   = 2;
+                ggml_tensor * glu = nodes[node_idx + 1];
+                const bool    mm_is_gate = glu->src[0] == node;
+                webgpu_encoded_op op     = ggml_webgpu_mul_mat_pvr(ctx, src0, src1, glu,
+                                                                   mm_is_gate ? glu->src[1] : glu->src[0], mm_is_gate);
+                ctx->pvr_staged_src1 = nullptr;  // the SwiGLU's output may sit where a staged src1 was
+                return op;
+            }
             return ggml_webgpu_mul_mat(ctx, src0, src1, node);
         case GGML_OP_MUL_MAT_ID:
             return ggml_webgpu_mul_mat_id(ctx, src0, src1, src2, node);
@@ -3531,6 +4698,13 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         case GGML_OP_GROUP_NORM:
             return ggml_webgpu_group_norm(ctx, src0, node);
         case GGML_OP_RMS_NORM:
+            {
+                ggml_webgpu_pvr_post_norm post_norm;
+                if (ggml_webgpu_pvr_post_norm_nodes(ctx, cgraph, node_idx, post_norm)) {
+                    num_encoded_ops = 5;
+                    return ggml_webgpu_pvr_rms_norm_add(ctx, post_norm);
+                }
+            }
             if (ggml_webgpu_can_fuse_rms_norm_mul(cgraph, node_idx)) {
                 num_encoded_ops        = 2;
                 ggml_tensor * mul_node = nodes[node_idx + 1];
@@ -3582,9 +4756,14 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_pad(ctx, src0, node);
         case GGML_OP_ARGMAX:
             return ggml_webgpu_argmax(ctx, src0, node);
-        case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+            if (const int concat_at = ggml_webgpu_topk_pvr_fused_nodes(ctx, cgraph, node_idx)) {
+                num_encoded_ops = concat_at + 1;
+                return ggml_webgpu_topk_pvr(ctx, src0, node, cgraph->nodes[node_idx + concat_at]);
+            }
             // we reuse the same argsort implementation for top_k
+            return ggml_webgpu_argsort(ctx, src0, node);
+        case GGML_OP_ARGSORT:
             return ggml_webgpu_argsort(ctx, src0, node);
         case GGML_OP_CUMSUM:
             return ggml_webgpu_cumsum(ctx, src0, node);
@@ -3661,6 +4840,356 @@ static void ggml_backend_webgpu_check_set_rows(webgpu_context & ctx, uint32_t & 
 #endif
 }
 
+// PowerVR: LFM2/LFM3's short convolution on 1 to 8 tokens of one sequence
+// (llm_build_lfm_base::build_lfm_shortconv) in one dispatch, shortconv_pvr.wgsl.
+// The graph has, per conv layer: the old state gathered from the recurrent
+// cache (GET_ROWS), B * X (MUL), the state and B * X concatenated (CONCAT),
+// a CPY of each rollback snapshot of the state into the cache, the conv
+// (SSM_CONV) and C times it (MUL), the next product's src1. The next layer's
+// gather sits among them, so these nodes aren't consecutive: a pass over the
+// graph finds them, and the fused op runs at the last (the MUL), the others
+// being skipped. It reads the old state from the cache itself, as the
+// gather's output may be reused by then, and writes the snapshots. The conv
+// has `width` taps (LFM2: 3, LFM3: 7) and the state width - 1 values per
+// channel.
+struct ggml_webgpu_pvr_shortconv {
+    ggml_tensor *              bcx   = nullptr;  // the in-projection's output (B, C and X are views of it)
+    ggml_tensor *              b     = nullptr;
+    ggml_tensor *              c     = nullptr;
+    ggml_tensor *              x     = nullptr;
+    ggml_tensor *              cache = nullptr;  // the recurrent cache (conv states)
+    ggml_tensor *              rows  = nullptr;  // the gather's view of it (a state per row)
+    ggml_tensor *              idx   = nullptr;  // the row to gather
+    ggml_tensor *              w     = nullptr;  // the conv weights
+    ggml_tensor *              y     = nullptr;  // C times the conv
+    std::vector<ggml_tensor *> snaps;            // the snapshots' rows in the cache, slot 0 first
+    uint32_t                   n     = 0;        // tokens
+    uint32_t                   width = 0;        // the conv's taps
+};
+
+static const ggml_tensor * ggml_webgpu_base(const ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+static ggml_tensor * ggml_webgpu_base(ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+// the tensor under a chain of views (RESHAPE, VIEW, TRANSPOSE: what's left is a computed one)
+static const ggml_tensor * ggml_webgpu_unview(const ggml_tensor * t) {
+    while (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+static ggml_tensor * ggml_webgpu_unview(ggml_tensor * t) {
+    while (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+// a [ch, n] view of bcx with contiguous rows
+static bool ggml_webgpu_pvr_shortconv_part(const ggml_tensor * v, const ggml_tensor * bcx, int64_t ch, int64_t n) {
+    return v->view_src == bcx && v->type == GGML_TYPE_F32 && v->ne[0] == ch && v->ne[1] == n && v->ne[2] == 1 &&
+           v->ne[3] == 1 && v->nb[0] == sizeof(float) && v->nb[1] == bcx->nb[1] && bcx->type == GGML_TYPE_F32 &&
+           ggml_webgpu_tensor_offset(v) % sizeof(float) == 0;
+}
+
+// The fused op's tensors, from the nodes where at says they are.
+static ggml_webgpu_pvr_shortconv ggml_webgpu_pvr_shortconv_get(const ggml_cgraph *                 cgraph,
+                                                               const ggml_webgpu_pvr_shortconv_at & at) {
+    ggml_tensor * gr = cgraph->nodes[at.gi];
+    ggml_tensor * bx = cgraph->nodes[at.bi];
+    ggml_tensor * sc = cgraph->nodes[at.si];
+    ggml_tensor * y  = cgraph->nodes[at.yi];
+    ggml_webgpu_pvr_shortconv f;
+    f.rows  = gr->src[0];
+    f.idx   = gr->src[1];
+    f.cache = ggml_webgpu_base(f.rows);
+    f.b     = bx->src[0];
+    f.x     = bx->src[1];
+    f.bcx   = ggml_webgpu_base(f.b);
+    f.w     = sc->src[1];
+    f.y     = y;
+    f.c     = y->src[0] == sc ? y->src[1] : y->src[0];
+    for (int i : at.snaps) {
+        f.snaps.push_back(cgraph->nodes[i]->src[1]);
+    }
+    f.n     = (uint32_t) sc->ne[1];
+    f.width = (uint32_t) f.w->ne[0];
+    return f;
+}
+
+// Finds the fused short convolutions of cgraph: marks the nodes they replace
+// in skip, and records each by the index of the node where it runs.
+static void ggml_webgpu_pvr_shortconv_nodes(webgpu_context &                                        ctx,
+                                            ggml_cgraph *                                           cgraph,
+                                            std::vector<uint8_t> &                                  skip,
+                                            std::unordered_map<int, ggml_webgpu_pvr_shortconv_at> & fused) {
+    const int n_nodes = cgraph->n_nodes;
+    bool      any     = false;
+    for (int i = 0; i < n_nodes && !any; i++) {
+        any = cgraph->nodes[i]->op == GGML_OP_SSM_CONV;
+    }
+    if (!any) {
+        return;
+    }
+    // the nodes that read each tensor (through views): (tensor, node) pairs, sorted
+    std::vector<std::pair<const ggml_tensor *, int>> reads;
+    reads.reserve(4 * n_nodes);
+    for (int i = 0; i < n_nodes; i++) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        if (ggml_op_is_empty(t->op) || ggml_is_empty(t)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC && t->src[j]; j++) {
+            reads.push_back({ ggml_webgpu_base(t->src[j]), i });
+        }
+    }
+    std::sort(reads.begin(), reads.end());
+    // whether every node reading t is in allowed or more
+    auto users_in = [&](const ggml_tensor * t, std::initializer_list<int> allowed, const std::vector<int> & more) {
+        auto it = std::lower_bound(reads.begin(), reads.end(), std::pair<const ggml_tensor *, int>{ t, INT_MIN });
+        for (; it != reads.end() && it->first == t; ++it) {
+            const int u = it->second;
+            if (std::find(allowed.begin(), allowed.end(), u) == allowed.end() &&
+                std::find(more.begin(), more.end(), u) == more.end()) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // the index of node t among the 64 before at, or -1
+    auto index_before = [&](const ggml_tensor * t, int at) {
+        for (int i = at - 1; i >= 0 && i >= at - 64; i--) {
+            if (cgraph->nodes[i] == t) {
+                return i;
+            }
+        }
+        return -1;
+    };
+    for (int si = 0; si < n_nodes; si++) {
+        ggml_tensor * sc = cgraph->nodes[si];
+        if (sc->op != GGML_OP_SSM_CONV || (sc->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        ggml_tensor * cat = sc->src[0];
+        ggml_tensor * w   = sc->src[1];
+        const int64_t ch  = sc->ne[0];
+        const int64_t n   = sc->ne[1];
+        // the conv's taps, and the state's values per channel (width - 1); not 4 taps, which
+        // ssm_conv.wgsl sums as one expression rather than as fused multiply-adds
+        const int64_t width = w->ne[0];
+        const int64_t ds    = width - 1;
+        if (sc->type != GGML_TYPE_F32 || n < 1 || n > 8 || sc->ne[2] != 1 || sc->ne[3] != 1 || !ggml_is_contiguous(sc) ||
+            w->type != GGML_TYPE_F32 || width < 2 || width > 8 || width == 4 || w->ne[1] != ch ||
+            !ggml_is_contiguous(w) || cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 ||
+            cat->type != GGML_TYPE_F32 || cat->ne[0] != n + ds || cat->ne[1] != ch || cat->ne[2] != 1 ||
+            !ggml_is_contiguous(cat)) {
+            continue;
+        }
+        const int ci = index_before(cat, si);
+        if (ci < 0) {
+            continue;
+        }
+        // the old state: a [width - 1, ch] reshape of a one-row gather from the cache
+        ggml_tensor *       st = cat->src[0];
+        ggml_tensor *       gr = ggml_webgpu_unview(st);
+        if (st->ne[0] != ds || st->ne[1] != ch || !ggml_is_contiguous(st) || st->type != GGML_TYPE_F32 ||
+            gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || gr->ne[0] != ds * ch || gr->ne[1] != 1 ||
+            gr->ne[2] != 1 || ggml_webgpu_tensor_offset(st) != ggml_webgpu_tensor_offset(gr)) {
+            continue;
+        }
+        const int gi = index_before(gr, ci);
+        if (gi < 0) {
+            continue;
+        }
+        ggml_tensor * rows = gr->src[0];
+        ggml_tensor * idx  = gr->src[1];
+        ggml_tensor * cache = ggml_webgpu_base(rows);
+        if (rows->type != GGML_TYPE_F32 || rows->nb[0] != sizeof(float) || rows->ne[0] != ds * ch ||
+            idx->type != GGML_TYPE_I32 || idx->ne[0] < 1 || cache->type != GGML_TYPE_F32 ||
+            ggml_webgpu_tensor_offset(rows) % sizeof(float) != 0 || rows->nb[1] % sizeof(float) != 0) {
+            continue;
+        }
+        // B * X, transposed into the CONCAT
+        const ggml_tensor * tr = cat->src[1];
+        if (tr->op != GGML_OP_TRANSPOSE) {
+            continue;
+        }
+        ggml_tensor * bx = tr->src[0];
+        if (bx->op != GGML_OP_MUL || bx->type != GGML_TYPE_F32 || bx->ne[0] != ch || bx->ne[1] != n ||
+            bx->ne[2] != 1) {
+            continue;
+        }
+        const int bi = index_before(bx, ci);
+        if (bi < 0) {
+            continue;
+        }
+        ggml_tensor * bcx = ggml_webgpu_base(bx->src[0]);
+        if (!ggml_webgpu_pvr_shortconv_part(bx->src[0], bcx, ch, n) ||
+            !ggml_webgpu_pvr_shortconv_part(bx->src[1], bcx, ch, n)) {
+            continue;
+        }
+        // C times the conv: the next node that reads the conv
+        int yi = -1;
+        for (int i = si + 1; i < n_nodes && i < si + 8; i++) {
+            const ggml_tensor * t = cgraph->nodes[i];
+            if (t->op == GGML_OP_MUL && (t->src[0] == sc || t->src[1] == sc)) {
+                yi = i;
+                break;
+            }
+        }
+        if (yi < 0) {
+            continue;
+        }
+        ggml_tensor * y    = cgraph->nodes[yi];
+        ggml_tensor * cpar = y->src[0] == sc ? y->src[1] : y->src[0];
+        if (y->type != GGML_TYPE_F32 || y->ne[0] != ch || y->ne[1] != n || y->ne[2] != 1 || !ggml_is_contiguous(y) ||
+            !ggml_webgpu_pvr_shortconv_part(cpar, bcx, ch, n)) {
+            continue;
+        }
+        // the snapshots: CPYs of [width - 1, ch] views of the CONCAT into rows of the cache, slot s at token n - s
+        std::vector<int> snap_nodes;
+        bool             ok = true;
+        for (int i = ci + 1; i < si && ok; i++) {
+            ggml_tensor * t = cgraph->nodes[i];
+            if (t->op != GGML_OP_CPY || ggml_is_empty(t)) {
+                continue;
+            }
+            const ggml_tensor * src = t->src[0];
+            ggml_tensor *       dst = t->src[1];
+            if (src->view_src != cat) {
+                continue;
+            }
+            const int64_t s = (int64_t) snap_nodes.size();
+            ok = src->ne[0] == ds && src->ne[1] == ch && src->nb[1] == cat->nb[1] &&
+                 src->view_offs == (size_t) (n - s) * sizeof(float) && ggml_webgpu_base(dst) == cache &&
+                 ggml_nelements(dst) == ds * ch && ggml_is_contiguous(dst) && t->type == GGML_TYPE_F32 &&
+                 dst->type == GGML_TYPE_F32 && s < n;
+            snap_nodes.push_back(i);
+        }
+        if (!ok || snap_nodes.empty()) {
+            continue;
+        }
+        // nothing else reads what the skipped nodes write, and they come before the MUL
+        if (!(gi < yi && bi < yi && ci < yi && si < yi) || !users_in(cat, { si }, snap_nodes) ||
+            !users_in(bx, { ci }, {}) || !users_in(gr, { ci }, {}) || !users_in(sc, { yi }, {})) {
+            continue;
+        }
+        // nor touches the cache between the gather and the MUL (the gather's reads and the CPYs' writes
+        // happen at the MUL), nor writes where the row index is: the gather was its last reader, so its
+        // memory may be another node's by the MUL (the last conv layer's)
+        {
+            bool touched = false;
+            for (int i = gi + 1; i < yi && !touched; i++) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                if (ggml_op_is_empty(t->op) || ggml_is_empty(t) || i == bi || i == ci || i == si ||
+                    std::find(snap_nodes.begin(), snap_nodes.end(), i) != snap_nodes.end()) {
+                    continue;
+                }
+                touched = ggml_webgpu_base(t) == cache || ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, t, idx);
+                for (int j = 0; j < GGML_MAX_SRC && t->src[j] && !touched; j++) {
+                    touched = ggml_webgpu_base(t->src[j]) == cache;
+                }
+            }
+            if (touched) {
+                continue;
+            }
+        }
+        // y overlaps none of what's read
+        if (ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, y, bcx) ||
+            ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, y, idx) ||
+            ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, y, cache) ||
+            ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, y, w) ||
+            ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, cache, bcx) ||
+            ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, cache, idx) ||
+            ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, cache, w)) {
+            continue;
+        }
+        ggml_webgpu_pvr_shortconv_at at;
+        at.gi    = gi;
+        at.bi    = bi;
+        at.ci    = ci;
+        at.si    = si;
+        at.yi    = yi;
+        at.snaps = snap_nodes;
+        fused[yi] = at;
+        for (int i : { gi, bi, ci, si }) {
+            skip[i] = 1;
+        }
+        for (int i : snap_nodes) {
+            skip[i] = 1;
+        }
+    }
+}
+
+static webgpu_encoded_op ggml_webgpu_pvr_shortconv_op(webgpu_context & ctx, const ggml_webgpu_pvr_shortconv & f) {
+    const size_t   bcx_at   = ggml_webgpu_tensor_align_offset(ctx, f.bcx);
+    const size_t   cache_at = ggml_webgpu_tensor_align_offset(ctx, f.cache);
+    const uint32_t ch       = (uint32_t) f.y->ne[0];
+    auto           el       = [](size_t bytes) { return (uint32_t) (bytes / sizeof(float)); };
+    std::vector<uint32_t> params = {
+        el(ggml_webgpu_tensor_offset(f.b) - bcx_at),
+        el(ggml_webgpu_tensor_offset(f.c) - bcx_at),
+        el(ggml_webgpu_tensor_offset(f.x) - bcx_at),
+        el(f.b->nb[1]),
+        el(ggml_webgpu_tensor_offset(f.rows) - cache_at),
+        el(f.rows->nb[1]),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, f.idx) / sizeof(int32_t)),
+        el(ggml_webgpu_tensor_misalignment(ctx, f.w)),
+        el(ggml_webgpu_tensor_misalignment(ctx, f.y)),
+        el(f.y->nb[1]),
+        ch,
+        (uint32_t) f.snaps.size(),
+    };
+    for (size_t s = 0; s < 8; s++) {
+        params.push_back(s < f.snaps.size() ? el(ggml_webgpu_tensor_offset(f.snaps[s]) - cache_at) : 0u);
+    }
+    const size_t bytes = ROUNDUP_POW2(ggml_nbytes(f.y), 16);
+    ggml_webgpu_pvr_stage_next(ctx, bytes);
+    // the weights bound read-only when they sit in another buffer than the outputs (y, the cache)
+    const WGPUBuffer w_buf = ggml_webgpu_tensor_buf(f.w).Get();
+    const bool w_ro = w_buf != ggml_webgpu_tensor_buf(f.y).Get() && w_buf != ggml_webgpu_tensor_buf(f.cache).Get();
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, f.bcx),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, f.cache),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, f.idx),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, f.w),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, f.y),
+        ggml_webgpu_make_bind_group_entry(5, ctx->pvr_staging_buf[ctx->pvr_staged_idx], 0, bytes),
+    };
+    ctx->pvr_staged_src1  = f.y;
+    ctx->pvr_staged_f16   = false;
+    ctx->pvr_staged_by_op = true;
+    webgpu_pipeline pipeline = ctx->shader_lib->get_shortconv_pvr_pipeline(f.n, f.width, w_ro);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, CEIL_DIV(ch, WEBGPU_SHORTCONV_PVR_WG_SIZE));
+}
+
+// The graph's signature for the short-conv pass (see webgpu_context_struct::pvr_sc): per node, the
+// node, its output, op, shape, strides and sources (and theirs).
+static void ggml_webgpu_pvr_graph_sig(const ggml_cgraph * cgraph, std::vector<uintptr_t> & sig) {
+    sig.clear();
+    sig.reserve((size_t) cgraph->n_nodes * 12);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        sig.push_back((uintptr_t) t);
+        sig.push_back((uintptr_t) t->data);
+        sig.push_back((uintptr_t) t->op);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            sig.push_back((uintptr_t) t->ne[d]);
+        }
+        sig.push_back((uintptr_t) t->nb[1]);
+        for (int j = 0; j < GGML_MAX_SRC && t->src[j]; j++) {
+            sig.push_back((uintptr_t) t->src[j]);
+            sig.push_back((uintptr_t) t->src[j]->data);
+        }
+        sig.push_back(0);
+    }
+}
+
 static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_graph_compute(" << cgraph->n_nodes << " nodes)");
 
@@ -3686,12 +5215,44 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     if (ctx->batch_compute_passes) {
         ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
     }
+    ctx->pvr_staged_src1 = nullptr;
+
+    // PowerVR: the short convolutions run as one op each (see ggml_webgpu_pvr_shortconv); a graph run
+    // again (the same nodes, outputs and sources) reuses what the pass over it found
+    std::vector<uint8_t> *                                 pvr_skip      = nullptr;
+    std::unordered_map<int, ggml_webgpu_pvr_shortconv_at> * pvr_shortconv = nullptr;
+    if (ggml_webgpu_is_pvr(ctx->global_ctx)) {
+        auto &                 sc = ctx->pvr_sc;
+        std::vector<uintptr_t> sig;
+        ggml_webgpu_pvr_graph_sig(cgraph, sig);
+        if (sc.graph != cgraph || sc.sig != sig) {
+            sc.graph = cgraph;
+            sc.sig   = std::move(sig);
+            sc.skip.assign(cgraph->n_nodes, 0);
+            sc.fused.clear();
+            ggml_webgpu_pvr_shortconv_nodes(ctx, cgraph, sc.skip, sc.fused);
+        }
+        pvr_skip      = &sc.skip;
+        pvr_shortconv = &sc.fused;
+    }
 
     while (node_idx < cgraph->n_nodes) {
         if (cgraph->nodes[node_idx]->op == GGML_OP_SET_ROWS) {
             contains_set_rows = true;
         }
-        if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
+        ctx->pvr_staged_by_op = false;
+        if (pvr_skip && (*pvr_skip)[node_idx]) {
+            node_idx++;
+            continue;
+        }
+        std::optional<webgpu_encoded_op> fused_cmd;
+        if (pvr_shortconv && !pvr_shortconv->empty()) {
+            auto it = pvr_shortconv->find(node_idx);
+            if (it != pvr_shortconv->end()) {
+                fused_cmd = ggml_webgpu_pvr_shortconv_op(ctx, ggml_webgpu_pvr_shortconv_get(cgraph, it->second));
+            }
+        }
+        if (auto cmd = fused_cmd ? fused_cmd : ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
             commands.push_back(*cmd);
             num_batched_kernels += cmd.value().num_kernels;
 #ifdef GGML_WEBGPU_GPU_PROFILE
@@ -3700,7 +5261,12 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
 #endif
         }
 
-        if (num_batched_kernels >= ctx->global_ctx->command_submit_batch_size) {
+        // PowerVR: the GPU waits for the first submit of each graph, so submit
+        // the first batch early (after a few dispatches), the rest as usual
+        const uint32_t batch_size = ggml_webgpu_is_pvr(ctx->global_ctx) && num_inflight_batches == 0 ?
+                                        WEBGPU_PVR_FIRST_SUBMIT_BATCH_SIZE :
+                                        ctx->global_ctx->command_submit_batch_size;
+        if (num_batched_kernels >= batch_size) {
             if (ctx->active_compute_pass) {
                 ctx->active_compute_pass.End();
             }
@@ -3725,6 +5291,19 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                 profile_pipeline_names.clear();
             }
 #endif
+        }
+
+        // an op that wrote where the staged src1 sat (that tensor's memory
+        // now holds another) makes the staged copy stale
+        if (ctx->pvr_staged_src1 != nullptr && !ctx->pvr_staged_by_op) {
+            for (int i = node_idx; i < node_idx + num_encoded_ops && i < cgraph->n_nodes; i++) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                if (!ggml_op_is_empty(t->op) && t != ctx->pvr_staged_src1 &&
+                    ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, t, ctx->pvr_staged_src1)) {
+                    ctx->pvr_staged_src1 = nullptr;
+                    break;
+                }
+            }
         }
 
         node_idx += num_encoded_ops;
@@ -3808,6 +5387,12 @@ static void ggml_backend_webgpu_event_wait(ggml_backend_t backend, ggml_backend_
     ggml_backend_webgpu_device_event_synchronize(nullptr, event);
 }
 
+static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                  ggml_tensor *         tensor,
+                                                  const void *          data,
+                                                  size_t                offset,
+                                                  size_t                size);
+
 static void ggml_backend_webgpu_set_tensor_async(ggml_backend_t backend,
                                                  ggml_tensor *  tensor,
                                                  const void *   data,
@@ -3815,9 +5400,17 @@ static void ggml_backend_webgpu_set_tensor_async(ggml_backend_t backend,
                                                  size_t         size) {
     GGML_UNUSED(backend);
     auto * buf_ctx      = (ggml_backend_webgpu_buffer_context *) tensor->buffer->context;
+    // PowerVR: a tensor that is or becomes repacked (see ggml_webgpu_pvr_repacked_marker) is written by
+    // set_tensor, which moves the bytes into its layout
+    if (ggml_webgpu_pvr_is_repacked(tensor) ||
+        (offset == 0 && size == ggml_nbytes(tensor) && ggml_webgpu_pvr_repackable(buf_ctx->global_ctx, tensor))) {
+        ggml_backend_webgpu_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
     size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
     // Write aligned portion
+    buf_ctx->global_ctx->pvr_write_epoch++;
     buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
 
     if (size % 4 != 0) {
@@ -3836,8 +5429,36 @@ static void ggml_backend_webgpu_set_tensor_async(ggml_backend_t backend,
     }
 }
 
+static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                  const ggml_tensor *   tensor,
+                                                  void *                data,
+                                                  size_t                offset,
+                                                  size_t                size);
+
+// On PowerVR a read back (copy, then map) already waits for all the work
+// submitted before it, and each wait costs a few ms on Android: read without
+// waiting for the queue first, as the generic fallback (synchronize, then
+// read) would. This saves a wait per token, before the logits are read.
+static void ggml_backend_webgpu_get_tensor_async(ggml_backend_t      backend,
+                                                 const ggml_tensor * tensor,
+                                                 void *              data,
+                                                 size_t              offset,
+                                                 size_t              size) {
+    ggml_backend_webgpu_context * backend_ctx = (ggml_backend_webgpu_context *) backend->context;
+    if (!ggml_webgpu_is_pvr(backend_ctx->webgpu_ctx->global_ctx)) {
+        ggml_backend_synchronize(backend);
+    }
+    ggml_backend_tensor_get(tensor, data, offset, size);
+}
+
 static void ggml_backend_webgpu_synchronize(ggml_backend_t backend) {
     ggml_backend_webgpu_context * backend_ctx = (ggml_backend_webgpu_context *) backend->context;
+    // The scheduler synchronizes about 20 times per token, and on PowerVR
+    // (Android) each wait costs a few ms even with nothing in flight: skip the
+    // ones with no work submitted since the last.
+    if (ggml_webgpu_is_pvr(backend_ctx->webgpu_ctx->global_ctx) && backend_ctx->webgpu_ctx->global_ctx->queue_idle) {
+        return;
+    }
     ggml_backend_webgpu_wait_queue(backend_ctx->webgpu_ctx->global_ctx);
 }
 
@@ -3845,7 +5466,7 @@ static ggml_backend_i ggml_backend_webgpu_i = {
     /* .get_name                = */ ggml_backend_webgpu_name,
     /* .free                    = */ ggml_backend_webgpu_free,
     /* .set_tensor_async        = */ ggml_backend_webgpu_set_tensor_async,
-    /* .get_tensor_async        = */ NULL,
+    /* .get_tensor_async        = */ ggml_backend_webgpu_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
@@ -3867,6 +5488,9 @@ static ggml_backend_i ggml_backend_webgpu_i = {
 static void ggml_backend_webgpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_webgpu_buffer_context * ctx = static_cast<ggml_backend_webgpu_buffer_context *>(buffer->context);
     if (ctx != nullptr && ctx->buffer != nullptr) {
+        if (ctx->global_ctx->pvr_readback_src == ctx->buffer.Get()) {
+            ctx->global_ctx->pvr_readback_src = nullptr;  // a new buffer may get the same handle
+        }
         ctx->buffer.Destroy();
         delete ctx;
     }
@@ -3877,6 +5501,12 @@ static void * ggml_backend_webgpu_buffer_get_base(ggml_backend_buffer_t buffer) 
     GGML_UNUSED(buffer);
     return webgpu_ptr_base;
 }
+
+static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                  ggml_tensor *         tensor,
+                                                  const void *          data,
+                                                  size_t                offset,
+                                                  size_t                size);
 
 static void ggml_backend_webgpu_buffer_memset_tensor(ggml_backend_buffer_t buffer,
                                                      ggml_tensor *         tensor,
@@ -3897,12 +5527,70 @@ static void ggml_backend_webgpu_buffer_memset_tensor(ggml_backend_buffer_t buffe
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_buffer_memset_tensor(" << buf_ctx->label << ", " << tensor << ", " << value
                                                                  << ", " << offset << ", " << size << ")");
 
+    if (ggml_webgpu_pvr_is_repacked(tensor) && (offset != 0 || size != ggml_nbytes(tensor))) {
+        // repacking moves bytes, so only setting the whole tensor is the same in both layouts
+        std::vector<uint8_t> part(size, value);
+        ggml_backend_webgpu_buffer_set_tensor(buffer, tensor, part.data(), offset, size);
+        WEBGPU_CPU_PROFILE_TOTAL_END(memset_tensor, buf_ctx->global_ctx);
+        return;
+    }
+
     size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
     // This is a trick to set all bytes of a u32 to the same 1 byte value.
     uint32_t val32 = (uint32_t) value * 0x01010101;
     ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, val32, total_offset, size);
     WEBGPU_CPU_PROFILE_TOTAL_END(memset_tensor, buf_ctx->global_ctx);
+}
+
+static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                  const ggml_tensor *   tensor,
+                                                  void *                data,
+                                                  size_t                offset,
+                                                  size_t                size);
+
+// Uploads a whole Q4_K or Q6_K tensor in layout A (see
+// ggml_webgpu_pvr_repacked_marker), a few thousand rows of a block column at
+// a time: in layout A each part of those rows' blocks is contiguous.
+static void ggml_webgpu_pvr_upload_repacked(ggml_backend_webgpu_buffer_context * buf_ctx,
+                                            ggml_tensor *                        tensor,
+                                            const void *                         data) {
+    const int64_t m    = tensor->ne[1];
+    const int64_t nb   = tensor->ne[0] / 256;
+    const int64_t nblk = m * nb;
+    const size_t  base = ggml_webgpu_tensor_offset(tensor);
+    const size_t  bs   = ggml_type_size(tensor->type);
+    // the parts of a block: (offset of its plane, bytes per block)
+    std::vector<std::pair<size_t, size_t>> parts;
+    if (tensor->type == GGML_TYPE_Q4_K) {
+        parts = { { 0, 16 }, { (size_t) nblk * 16, 128 } };
+    } else {
+        parts = { { 0, 128 }, { (size_t) nblk * 128, 64 }, { (size_t) nblk * 192, 16 }, { (size_t) nblk * 208, 2 } };
+    }
+    // rows per chunk: a multiple of 4, so that every write is 4-byte aligned
+    const int64_t        chunk = std::min<int64_t>(m, 4096);
+    std::vector<uint8_t> col((size_t) chunk * bs);
+    std::vector<uint8_t> a((size_t) chunk * bs);
+    for (int64_t b = 0; b < nb; b++) {
+        for (int64_t r0 = 0; r0 < m; r0 += chunk) {
+            const int64_t rows = std::min(chunk, m - r0);
+            // the chunk's blocks as a tensor of their own (one block per row), repacked
+            for (int64_t r = 0; r < rows; r++) {
+                memcpy(col.data() + r * bs, (const uint8_t *) data + ((r0 + r) * nb + b) * bs, bs);
+            }
+            ggml_webgpu_pvr_repack_column(tensor->type, rows, 1, 0, true, col.data(), a.data());
+            // its planes are the chunk's parts of the whole tensor's planes
+            size_t src_off = 0;
+            for (const auto & [plane, per_blk] : parts) {
+                const size_t bytes = (size_t) rows * per_blk;
+                buf_ctx->global_ctx->pvr_write_epoch++;
+                buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, base + plane + (size_t) (b * m + r0) * per_blk,
+                                                       a.data() + src_off, bytes);
+                src_off += bytes;
+            }
+        }
+    }
+    tensor->extra = &ggml_webgpu_pvr_repacked_marker;
 }
 
 static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
@@ -3912,6 +5600,21 @@ static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                   size_t                size) {
     WEBGPU_CPU_PROFILE_TOTAL_START(set_tensor);
     ggml_backend_webgpu_buffer_context * buf_ctx = (ggml_backend_webgpu_buffer_context *) buffer->context;
+
+    if (offset == 0 && size == ggml_nbytes(tensor) && ggml_webgpu_pvr_repackable(buf_ctx->global_ctx, tensor)) {
+        ggml_webgpu_pvr_upload_repacked(buf_ctx, tensor, data);
+        WEBGPU_CPU_PROFILE_TOTAL_END(set_tensor, buf_ctx->global_ctx);
+        return;
+    }
+    if (ggml_webgpu_pvr_is_repacked(tensor)) {
+        // part of a repacked tensor: read it back whole, write the part, and upload it again
+        std::vector<uint8_t> whole(ggml_nbytes(tensor));
+        ggml_backend_webgpu_buffer_get_tensor(buffer, tensor, whole.data(), 0, whole.size());
+        memcpy(whole.data() + offset, data, size);
+        ggml_webgpu_pvr_upload_repacked(buf_ctx, tensor, whole.data());
+        WEBGPU_CPU_PROFILE_TOTAL_END(set_tensor, buf_ctx->global_ctx);
+        return;
+    }
 
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_buffer_set_tensor(" << buf_ctx->label << ", " << tensor << ", " << data
                                                               << ", " << offset << ", " << size << ")");
@@ -3938,6 +5641,7 @@ static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
     }
 
     if (size > 0) {
+        buf_ctx->global_ctx->pvr_write_epoch++;
         buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
     }
 
@@ -4031,6 +5735,8 @@ static void ggml_backend_webgpu_buffer_set_tensor_n(ggml_backend_buffer_t       
         pass.End();
 
         wgpu::CommandBuffer commands = encoder.Finish();
+        ctx->queue_idle              = false;
+        ctx->pvr_write_epoch++;
         ctx->queue.Submit(1, &commands);
 
         src.clear();
@@ -4043,6 +5749,12 @@ static void ggml_backend_webgpu_buffer_set_tensor_n(ggml_backend_buffer_t       
 
     for (size_t i = 0; i < n_tensors; i++) {
         if (sizes[i] == 0) {
+            continue;
+        }
+        // PowerVR: a tensor that is or becomes repacked goes through set_tensor, which moves the bytes into its layout
+        if (ggml_webgpu_pvr_is_repacked(tensors[i]) || ggml_webgpu_pvr_repackable(ctx, tensors[i])) {
+            flush_tensors();
+            ggml_backend_webgpu_buffer_set_tensor(buffer, tensors[i], data[i], offsets[i], sizes[i]);
             continue;
         }
         wgpu::Buffer buf    = ggml_webgpu_tensor_buf(tensors[i]);
@@ -4064,11 +5776,11 @@ static void ggml_backend_webgpu_buffer_set_tensor_n(ggml_backend_buffer_t       
     WEBGPU_CPU_PROFILE_TOTAL_END(set_tensor_n, ctx);
 }
 
-static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
-                                                  const ggml_tensor *   tensor,
-                                                  void *                data,
-                                                  size_t                offset,
-                                                  size_t                size) {
+static void ggml_backend_webgpu_buffer_get_tensor_raw(ggml_backend_buffer_t buffer,
+                                                      const ggml_tensor *   tensor,
+                                                      void *                data,
+                                                      size_t                offset,
+                                                      size_t                size) {
     WEBGPU_CPU_PROFILE_TOTAL_START(get_tensor);
     ggml_backend_webgpu_buffer_context * buf_ctx = (ggml_backend_webgpu_buffer_context *) buffer->context;
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_buffer_get_tensor(" << buf_ctx->label << ", " << tensor << ", " << data
@@ -4093,6 +5805,34 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     std::lock_guard<std::recursive_mutex> lock(buf_ctx->global_ctx->mutex);
 
+    // On PowerVR each read back waits several ms, and saving the model's state
+    // reads the recurrent state one layer at a time: read a small state buffer
+    // back whole (not a compute buffer, which is read every token, a little
+    // of it: the logits), and serve further reads from that copy while
+    // nothing has been written since.
+    const size_t buf_size = buf_ctx->buffer.GetSize();
+    const bool   whole    = ggml_webgpu_is_pvr(buf_ctx->global_ctx) && buf_size <= WEBGPU_PVR_READBACK_MAX_BYTES &&
+                       buf_size % 4 == 0 && ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_ANY;
+    if (ggml_webgpu_is_pvr(buf_ctx->global_ctx) && buf_ctx->global_ctx->pvr_readback_src != nullptr &&
+        buf_ctx->global_ctx->pvr_readback_epoch != buf_ctx->global_ctx->pvr_write_epoch) {
+        // the copy is stale (written since): free it (it may be tens of MB)
+        webgpu_global_context & g = buf_ctx->global_ctx;
+        std::vector<uint8_t>().swap(g->pvr_readback_data);
+        g->pvr_readback_src = nullptr;
+    }
+    if (whole) {
+        webgpu_global_context & g = buf_ctx->global_ctx;
+        if (g->pvr_readback_src != buf_ctx->buffer.Get() || g->pvr_readback_epoch != g->pvr_write_epoch) {
+            total_offset = 0;
+            final_size   = buf_size;
+            local_offset = ggml_webgpu_tensor_offset(tensor) + offset;
+        } else {
+            std::memcpy(data, g->pvr_readback_data.data() + ggml_webgpu_tensor_offset(tensor) + offset, size);
+            WEBGPU_CPU_PROFILE_TOTAL_END(get_tensor, buf_ctx->global_ctx);
+            return;
+        }
+    }
+
     if (buf_ctx->global_ctx->get_tensor_staging_buf == nullptr ||
         buf_ctx->global_ctx->get_tensor_staging_buf.GetSize() < final_size) {
         // Create a new staging buffer if it doesn't exist or is too small
@@ -4110,18 +5850,49 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
     wgpu::CommandBuffer commands = encoder.Finish();
 
     // Submit the command buffer to the queue
+    buf_ctx->global_ctx->queue_idle = false;
     buf_ctx->global_ctx->queue.Submit(1, &commands);
 
     // Map the staging buffer to read the data
     ggml_backend_webgpu_map_buffer(buf_ctx->global_ctx, buf_ctx->global_ctx->get_tensor_staging_buf,
                                    wgpu::MapMode::Read, 0, final_size);
+    // The copy was the last submission and the queue runs in order, so it is
+    // idle now.
+    buf_ctx->global_ctx->queue_idle = true;
     // Must specify size here since the staging buffer might be larger than the tensor size
     const void * mapped_range = buf_ctx->global_ctx->get_tensor_staging_buf.GetConstMappedRange(0, final_size);
 
     // Copy the data from the mapped range to the output buffer
     std::memcpy(data, (const void *) ((const char *) mapped_range + local_offset), size);
+    if (whole && total_offset == 0 && final_size == buf_size) {
+        webgpu_global_context & g = buf_ctx->global_ctx;
+        g->pvr_readback_data.assign((const uint8_t *) mapped_range, (const uint8_t *) mapped_range + buf_size);
+        g->pvr_readback_src   = buf_ctx->buffer.Get();
+        g->pvr_readback_epoch = g->pvr_write_epoch;
+    }
     buf_ctx->global_ctx->get_tensor_staging_buf.Unmap();
     WEBGPU_CPU_PROFILE_TOTAL_END(get_tensor, buf_ctx->global_ctx);
+}
+
+static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                  const ggml_tensor *   tensor,
+                                                  void *                data,
+                                                  size_t                offset,
+                                                  size_t                size) {
+    if (!ggml_webgpu_pvr_is_repacked(tensor)) {
+        ggml_backend_webgpu_buffer_get_tensor_raw(buffer, tensor, data, offset, size);
+        return;
+    }
+    // a repacked tensor: read it whole and give back the original layout
+    const size_t         nbytes = ggml_nbytes(tensor);
+    std::vector<uint8_t> a(nbytes);
+    std::vector<uint8_t> orig(nbytes);
+    ggml_backend_webgpu_buffer_get_tensor_raw(buffer, tensor, a.data(), 0, nbytes);
+    const int64_t nb = tensor->ne[0] / 256;
+    for (int64_t b = 0; b < nb; b++) {
+        ggml_webgpu_pvr_repack_column(tensor->type, tensor->ne[1], nb, b, false, orig.data(), a.data());
+    }
+    memcpy(data, orig.data() + offset, size);
 }
 
 static void ggml_backend_webgpu_buffer_get_tensor_n(ggml_backend_buffer_t              buffer,
@@ -4137,6 +5908,17 @@ static void ggml_backend_webgpu_buffer_get_tensor_n(ggml_backend_buffer_t       
                                                                 << ", " << sizes << ", " << n_tensors << ")");
     webgpu_global_context global_ctx = buf_ctx->global_ctx;
     wgpu::Device          device     = global_ctx->device;
+
+    // PowerVR: repacked tensors are read back through get_tensor, which restores the original layout
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (ggml_webgpu_pvr_is_repacked(tensors[i])) {
+            for (size_t j = 0; j < n_tensors; j++) {
+                ggml_backend_webgpu_buffer_get_tensor(buffer, tensors[j], data[j], offsets[j], sizes[j]);
+            }
+            WEBGPU_CPU_PROFILE_TOTAL_END(get_tensor_n, buf_ctx->global_ctx);
+            return;
+        }
+    }
 
     typedef struct {
         size_t staging_size;
@@ -4212,6 +5994,7 @@ static void ggml_backend_webgpu_buffer_get_tensor_n(ggml_backend_buffer_t       
         wgpu::CommandBuffer commands = encoder.Finish();
 
         // Submit the command buffer to the queue
+        global_ctx->queue_idle = false;
         global_ctx->queue.Submit(1, &commands);
 
         // Map the staging buffer to read the data
@@ -4517,6 +6300,10 @@ static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     ctx->webgpu_global_ctx->command_submit_batch_size = ggml_backend_webgpu_get_command_submit_batch_size();
     ctx->webgpu_global_ctx->max_inflight_batches      = ggml_backend_webgpu_get_max_inflight_batches();
     ctx->webgpu_global_ctx->vendor                    = info.vendor;
+    if (ggml_webgpu_is_pvr(ctx->webgpu_global_ctx)) {
+        // PowerVR runs a token's ~450 dispatches faster in smaller command buffers
+        ctx->webgpu_global_ctx->command_submit_batch_size = WEBGPU_PVR_COMMAND_SUBMIT_BATCH_SIZE;
+    }
     ctx->webgpu_global_ctx->capabilities.supports_subgroups =
         ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::Subgroups);
     // for dot4I8packed
@@ -4646,6 +6433,58 @@ static webgpu_context initialize_webgpu_context(ggml_backend_dev_t dev) {
     ggml_webgpu_create_buffer(webgpu_ctx->global_ctx->device, webgpu_ctx->set_rows_host_error_buf,
                               WEBGPU_SET_ROWS_ERROR_BUF_SIZE_BYTES,
                               wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead, "set_rows_host_error_buf");
+    if (ggml_webgpu_is_pvr(webgpu_ctx->global_ctx)) {
+        // Prompt batches on PowerVR use pipelines that the warmup's two
+        // tokens don't: create them now, so that the browser compiles them in
+        // the background instead of during the first prompt.
+        webgpu_ctx->shader_lib->get_mul_mat_pvr_stage_pipeline(true);
+        // (the weights are repacked: see ggml_webgpu_pvr_repacked_marker)
+        webgpu_ctx->shader_lib->get_mul_mat_pvr_dequant_pipeline(GGML_TYPE_Q4_K, true);
+        webgpu_ctx->shader_lib->get_mul_mat_pvr_dequant_pipeline(GGML_TYPE_Q6_K, true);
+        for (int glu = 0; glu < 3; glu++) {
+            webgpu_ctx->shader_lib->get_mul_mat_pvr_gemm_pipeline(glu);
+        }
+        // The same for speculative batches (2 to 8 tokens) and the fused products.
+        const bool sg = ggml_webgpu_mul_mat_vec_pvr_subgroups(webgpu_ctx->global_ctx);
+        ggml_webgpu_mul_mat_vec_pvr_fusion add;
+        add.add = true;
+        ggml_webgpu_mul_mat_vec_pvr_fusion add_in_dst;
+        add_in_dst.add        = true;
+        add_in_dst.add_in_dst = true;
+        ggml_webgpu_mul_mat_vec_pvr_fusion glu;
+        glu.glu       = true;
+        glu.stage_out = true;
+        for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+            for (uint32_t ncol = 1; ncol <= WEBGPU_MUL_MAT_VEC_PVR_MAX_COLS; ncol++) {
+                // the shapes for small and large matrices
+                for (uint32_t m : { 1024u, 65536u }) {
+                    auto shape = [&](const ggml_webgpu_mul_mat_vec_pvr_fusion & f) {
+                        return ggml_webgpu_shader_lib::ggml_webgpu_mul_mat_vec_pvr_choose_shape(type, true, ncol, m, sg, f);
+                    };
+                    webgpu_ctx->shader_lib->get_mul_mat_vec_pvr_pipeline(type, true, ncol, sg, {}, shape({}));
+                    webgpu_ctx->shader_lib->get_mul_mat_vec_pvr_pipeline(type, true, ncol, sg, add, shape(add));
+                    webgpu_ctx->shader_lib->get_mul_mat_vec_pvr_pipeline(type, true, ncol, sg, add_in_dst,
+                                                                         shape(add_in_dst));
+                    if (type == GGML_TYPE_Q4_K) {
+                        webgpu_ctx->shader_lib->get_mul_mat_vec_pvr_pipeline(type, true, ncol, sg, glu, shape(glu));
+                    }
+                }
+            }
+        }
+        if (ggml_webgpu_pvr_subgroups_tile(webgpu_ctx->global_ctx, WEBGPU_FLASH_ATTN_PVR_MQ_ROWS * 2, 2)) {
+            webgpu_ctx->shader_lib->get_flash_attn_pvr_mq_pipeline(64, 2, true, true);
+        }
+        if (ggml_webgpu_pvr_subgroups_tile(webgpu_ctx->global_ctx, WEBGPU_FLASH_ATTN_PVR_MQ_ROWS * 4, 4)) {
+            webgpu_ctx->shader_lib->get_flash_attn_pvr_mq_pipeline(128, 4, true, true);
+        }
+        // LFM's fused short convolution for each batch size (the weights in their own buffer), of 3 taps
+        // (LFM2) and 7 (LFM3)
+        for (uint32_t width : { 3u, 7u }) {
+            for (uint32_t n = 1; n <= 8; n++) {
+                webgpu_ctx->shader_lib->get_shortconv_pvr_pipeline(n, width, true);
+            }
+        }
+    }
 
 #ifdef GGML_WEBGPU_GPU_PROFILE
     webgpu_ctx->batch_compute_passes = false;
@@ -4767,6 +6606,32 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
         (src1 != nullptr &&
          ggml_nbytes(src1) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize)) {
         return false;
+    }
+
+    // PowerVR: tensors that may be repacked (see ggml_webgpu_pvr_repacked_marker)
+    // are only read by matrix products through the PowerVR shaders, as their
+    // weights; other ops on them fall back to the CPU, which reads them back
+    // in their original layout.
+    if (ggml_webgpu_is_pvr(ctx->webgpu_global_ctx) && !ggml_op_is_empty(op->op)) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * src = op->src[i];
+            if (!ggml_webgpu_pvr_reads_repackable(ctx->webgpu_global_ctx, src)) {
+                continue;
+            }
+            const bool as_weights = op->op == GGML_OP_MUL_MAT && i == 0 && src->view_src == nullptr;
+            if (!as_weights || src1 == nullptr || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float) ||
+                op->nb[1] != op->ne[0] * sizeof(float) ||
+                src1->ne[1] > ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension ||
+                (size_t) src1->ne[0] * src1->ne[1] * sizeof(float) >
+                    ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize) {
+                return false;
+            }
+        }
+        if (ggml_webgpu_pvr_reads_repackable(ctx->webgpu_global_ctx, op)) {
+            // an op writing such a tensor (the layout of what it writes is the original one)
+            return false;
+        }
     }
 
     bool supports_op = false;

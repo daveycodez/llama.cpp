@@ -54,12 +54,27 @@ var<storage, read_write> mul_src: array<f32>;
 @group(0) @binding(2)
 var<storage, read_write> dst: array<f32>;
 
+#ifdef STAGED
+// PowerVR: the output also packed into the staging buffer, the next mat-vec's src1
+@group(0) @binding(3)
+var<storage, read_write> staged: array<f32>;
+
+@group(0) @binding(4)
+var<uniform> params: Params;
+
+fn update(rn_src_offset: u32, dst_offset: u32, scale: f32, mul_src_offset: u32) {
+    let v = scale * rn_src[rn_src_offset] * mul_src[mul_src_offset];
+    dst[dst_offset] = v;
+    staged[dst_offset - params.offset_dst] = v;
+}
+#else
 @group(0) @binding(3)
 var<uniform> params: Params;
 
 fn update(rn_src_offset: u32, dst_offset: u32, scale: f32, mul_src_offset: u32) {
     dst[dst_offset] = scale * rn_src[rn_src_offset] * mul_src[mul_src_offset];
 }
+#endif
 
 #endif
 

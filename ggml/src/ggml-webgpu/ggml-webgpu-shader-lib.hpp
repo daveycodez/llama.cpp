@@ -52,6 +52,19 @@
 // Matrix-vector multiplication parameters
 #define WEBGPU_MUL_MAT_VEC_WG_SIZE 256
 
+// PowerVR matrix products (mul_mat_vec_pvr.wgsl, mul_mat_pvr.wgsl, mul_mat_pvr_gemm.wgsl and their helpers)
+#define WEBGPU_MUL_MAT_VEC_PVR_WG_SIZE       128
+#define WEBGPU_SHORTCONV_PVR_WG_SIZE         64   // threads per workgroup of shortconv_pvr.wgsl
+#define WEBGPU_MUL_MAT_VEC_PVR_Q4_K_ROWS     32
+#define WEBGPU_MUL_MAT_VEC_PVR_Q6_K_ROWS     16
+#define WEBGPU_MUL_MAT_PVR_STAGE_WG_SIZE 256
+#define WEBGPU_MUL_MAT_PVR_TILE              16  // rows and columns per workgroup of mul_mat_pvr.wgsl
+#define WEBGPU_MUL_MAT_PVR_DEQUANT_WG_SIZE   256
+#define WEBGPU_MUL_MAT_PVR_TEX_W             2048  // texels per row of the dequantized weights' texture
+#define WEBGPU_MUL_MAT_PVR_GEMM_ROWS         32  // rows per workgroup of mul_mat_pvr_gemm.wgsl
+#define WEBGPU_MUL_MAT_PVR_GEMM_COLS         64  // columns per workgroup of mul_mat_pvr_gemm.wgsl
+#define WEBGPU_FLASH_ATTN_PVR_MQ_ROWS        64  // query rows per workgroup of flash_attn_pvr_mq.wgsl
+
 #define WEBGPU_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG    4
 #define WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG 4
 #define WEBGPU_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG      4
@@ -306,9 +319,11 @@ struct ggml_webgpu_rms_norm_mul_pipeline_key {
     bool inplace;      // rn_src == dst
     bool overlap;      // mul_src == dst
     bool src_overlap;  // rn_src binding overlaps mul_src binding
+    bool staged;       // PowerVR: the output also written into the mat-vec staging buffer
 
     bool operator==(const ggml_webgpu_rms_norm_mul_pipeline_key & other) const {
-        return inplace == other.inplace && overlap == other.overlap && src_overlap == other.src_overlap;
+        return inplace == other.inplace && overlap == other.overlap && src_overlap == other.src_overlap &&
+               staged == other.staged;
     }
 };
 
@@ -318,6 +333,7 @@ struct ggml_webgpu_rms_norm_mul_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.inplace);
         ggml_webgpu_hash_combine(seed, key.overlap);
         ggml_webgpu_hash_combine(seed, key.src_overlap);
+        ggml_webgpu_hash_combine(seed, key.staged);
         return seed;
     }
 };
@@ -973,6 +989,21 @@ inline uint32_t ggml_webgpu_flash_attn_get_vec_kv_tile(size_t   wg_mem_limit_byt
     return kv_tile;
 }
 
+// Threads of flash_attn_pvr.wgsl for head_dim, within wg_mem_limit bytes of
+// workgroup memory, or 0 if none fits. The threads merge their outputs
+// (WG_SIZE * head_dim floats) and their maxima and sums (2 * WG_SIZE floats)
+// there: 4096 / head_dim threads, 16 to 64, halved until that fits.
+inline uint32_t ggml_webgpu_flash_attn_pvr_wg_size(uint32_t head_dim, uint32_t wg_mem_limit) {
+    if (head_dim == 0) {
+        return 0;
+    }
+    uint32_t wg_size = std::max(16u, std::min(64u, 4096u / head_dim));
+    while (wg_size > 0 && (uint64_t) wg_size * (head_dim + 2) * sizeof(float) > wg_mem_limit) {
+        wg_size /= 2;
+    }
+    return wg_size;
+}
+
 inline bool ggml_webgpu_flash_attn_can_use_subgroup_matrix_path(bool                supports_subgroup_matrix,
                                                                 uint32_t            sg_mat_k,
                                                                 uint32_t            sg_mat_n,
@@ -1249,6 +1280,27 @@ inline bool ggml_webgpu_can_use_mmvq(const ggml_tensor * src0,
     return false;
 }
 
+// What mul_mat_vec_pvr.wgsl fuses in (see ggml_webgpu_mul_mat_vec_pvr_fused).
+struct ggml_webgpu_mul_mat_vec_pvr_fusion {
+    bool add        = false;  // dst = the product + another tensor
+    bool add_in_dst = false;  // ... which is dst itself
+    bool glu        = false;  // dst = SwiGLU of the products with src0 (the gate) and src0b
+    bool stage_out  = false;  // dst also written into a staging buffer, the next product's src1
+
+    int key() const { return (add ? 1 : 0) + (add_in_dst ? 2 : 0) + (glu ? 4 : 0) + (stage_out ? 8 : 0); }
+};
+
+// The shape of a PowerVR mat-vec (mul_mat_vec_pvr.wgsl): the weights' layout,
+// and the rows and threads per row of a thread. They only change which thread
+// computes what: a column's arithmetic is the same in all of them.
+struct ggml_webgpu_mul_mat_vec_pvr_shape {
+    bool     layout_a = false;  // weights repacked at load (see ggml_webgpu_pvr_repack)
+    uint32_t rb       = 1;      // rows per thread
+    uint32_t tpr      = 0;      // threads per row (0: lanes per block, 4 for Q4_K and 8 for Q6_K)
+
+    int key() const { return (layout_a ? 1 : 0) + (int) rb * 2 + (int) tpr * 16; }
+};
+
 class ggml_webgpu_shader_lib {
     std::unordered_map<ggml_webgpu_group_norm_pipeline_key, webgpu_pipeline, ggml_webgpu_group_norm_pipeline_key_hash>
         group_norm_pipelines;
@@ -1309,6 +1361,17 @@ class ggml_webgpu_shader_lib {
         mul_mat_vec_pipelines;   // fast mat-vec (n==1)
     std::unordered_map<ggml_webgpu_mul_mat_pipeline_key, webgpu_pipeline, ggml_webgpu_mul_mat_pipeline_key_hash>
         mul_mat_fast_pipelines;  // fast mat-mat (reg-tile or subgroup)
+    std::unordered_map<int, webgpu_pipeline> mul_mat_vec_pvr_pipelines;  // PowerVR mat-vec, see get_mul_mat_vec_pvr_pipeline
+    std::unordered_map<int, webgpu_pipeline> mul_mat_pvr_pipelines;      // PowerVR mat-mat, key is (src0 type * 2 + src0_ro) * 2 + layout_a
+    std::unordered_map<int, webgpu_pipeline> flash_attn_pvr_pipelines;   // PowerVR flash attention, key is head_dim * 4 + has_mask * 2 + kv_ro
+    std::unordered_map<int, webgpu_pipeline> flash_attn_pvr_mq_pipelines;  // the same, for several query rows
+    webgpu_pipeline                          mul_mat_pvr_stage_pipeline;
+    webgpu_pipeline                          mul_mat_pvr_stage_f16_pipeline;
+    webgpu_pipeline                          rms_norm_add_pvr_pipeline;
+    std::unordered_map<std::string, webgpu_pipeline> topk_pvr_pipelines;  // PowerVR top-k (topk_pvr.wgsl), by variant
+    std::unordered_map<int, webgpu_pipeline> shortconv_pvr_pipelines;      // PowerVR short conv (shortconv_pvr.wgsl)
+    std::unordered_map<int, webgpu_pipeline> mul_mat_pvr_dequant_pipelines;  // key is src0 type * 2 + layout_a
+    webgpu_pipeline                          mul_mat_pvr_gemm_pipelines[3];
     std::unordered_map<ggml_webgpu_quantize_q8_pipeline_key, webgpu_pipeline, ggml_webgpu_quantize_q8_pipeline_key_hash>
         quantize_q8_pipelines;
     std::unordered_map<ggml_webgpu_mul_mat_id_gather_pipeline_key,
@@ -2258,6 +2321,581 @@ class ggml_webgpu_shader_lib {
         return mul_mat_vec_pipelines[key];
     }
 
+    // The body of mul_mat_vec_pvr.wgsl's main(), written out for each of the
+    // ncol columns and rb rows of a thread (see there): plain variables
+    // rather than indexed arrays, and per column the one-column arithmetic.
+    static std::string ggml_webgpu_mul_mat_vec_pvr_body(bool                                       q4,
+                                                         uint32_t                                   ncol,
+                                                         uint32_t                                   rb,
+                                                         bool                                       subgroups,
+                                                         uint32_t                                   tpr,
+                                                         const ggml_webgpu_mul_mat_vec_pvr_fusion & fuse,
+                                                         bool                                       layout_a = false) {
+        // a Q6_K thread may take two lanes' pieces of a block (tpr 4): ppt pieces per thread
+        const uint32_t ppt = q4 ? 1 : 8 / tpr;
+        std::ostringstream w;
+        // line with {i} replaced by row index i and {c} by column index c
+        auto sub = [](std::string l, uint32_t i, uint32_t c) {
+            for (const auto & [key, val] : { std::pair<std::string, uint32_t>{ "{c}", c }, { "{i}", i } }) {
+                for (size_t pos; (pos = l.find(key)) != std::string::npos;) {
+                    l.replace(pos, key.size(), std::to_string(val));
+                }
+            }
+            return l;
+        };
+        // line once, or for each row, or for each row and column
+        auto emit = [&](const std::string & line, bool per_row, bool per_col) {
+            for (uint32_t i = 0; i < (per_row ? rb : 1); i++) {
+                for (uint32_t c = 0; c < (per_col ? ncol : 1); c++) {
+                    w << sub(line, i, c) << "\n";
+                }
+            }
+        };
+        auto rows      = [&](const std::string & line) { emit(line, true, false); };
+        auto rows_cols = [&](const std::string & line) { emit(line, true, true); };
+        // with GLU, each product (a: src0, the gate, b: src0b) has its own sums
+        const std::vector<std::string> prods =
+            fuse.glu ? std::vector<std::string>{ "a", "b" } : std::vector<std::string>{ "a" };
+        rows("    let row{i} = row_first + {i}u;");
+        if (layout_a) {
+            // the row itself (repacked weights are bound at their start)
+            rows("    let row_block{i} = min(row{i}, params.m - 1u);");
+            if (fuse.glu) {
+                rows("    let row_block_b{i} = min(row{i}, params.m - 1u);");
+            }
+        } else {
+            rows("    let row_block{i} = params.offset_src0 + min(row{i}, params.m - 1u) * params.stride_01;");
+            if (fuse.glu) {
+                rows("    let row_block_b{i} = params.stride_02 + min(row{i}, params.m - 1u) * params.stride_01;");
+            }
+        }
+        for (const std::string & v : prods) {
+            rows_cols("    var " + v + "{i}_{c} = 0.0;");
+            if (ppt == 2) {
+                rows_cols("    var " + v + "{i}_{c}h = 0.0;");
+            }
+        }
+        // (t / LPB is 0: a thread takes every block of its rows; written so, the
+        // loop compiles faster on PowerVR than from 0, which unrolls and spills)
+        w << "    for (var b = t / LPB; b < nb; b += BLOCKS_PER_ITER) {\n";
+        w << "        let xb = x0 + b * 64u;\n";
+        for (const std::string & v : prods) {
+            const std::string sfx = v == "a" ? "" : "_b";
+            const std::string rbk = v == "a" ? "row_block" : "row_block_b";
+            w << "        {\n";
+            // word p of block b of row i's weights
+            auto unpack = [&](const std::string & p) {
+                if (layout_a) {
+                    return std::string(q4 ? "q4k_unpack_a" : "q6k_unpack_a") + sfx + "(b * la_m + " + rbk + "{i}, la_nblk, " +
+                           p + ")";
+                }
+                return std::string(q4 ? "q4k_unpack" : "q6k_unpack") + sfx + "((" + rbk + "{i} + b) * " +
+                       (q4 ? "9u" : "210u") + ", " + p + ")";
+            };
+            if (q4) {
+                // the lane's first word against every column, then its second
+                w << "            let xo0 = xb + (lane >> 1u) * 16u + (lane & 1u) * 4u;\n";
+                w << "            let xo1 = xb + ((lane + 4u) >> 1u) * 16u + ((lane + 4u) & 1u) * 4u;\n";
+                rows("            let w0_{i} = " + unpack("lane") + ";");
+                emit("            let r{i}_{c} = q4k_col(w0_{i}, xo0 + {c}u * xs);", true, true);
+                rows("            let w1_{i} = " + unpack("lane + 4u") + ";");
+                rows_cols("            " + v + "{i}_{c} += r{i}_{c} + q4k_col(w1_{i}, xo1 + {c}u * xs);");
+            } else {
+                w << "            let xo = xb + 32u * (lane >> 2u) + 2u * (lane & 3u);\n";
+                rows("            let w0_{i} = " + unpack("lane") + ";");
+                rows_cols("            " + v + "{i}_{c} += q6k_col(w0_{i}, xo + {c}u * xs);");
+                if (ppt == 2) {
+                    // and the piece of lane + 4 (as the lane 4 apart would)
+                    w << "            let xo4 = xb + 32u * ((lane + 4u) >> 2u) + 2u * (lane & 3u);\n";
+                    rows("            let w4_{i} = " + unpack("lane + 4u") + ";");
+                    rows_cols("            " + v + "{i}_{c}h += q6k_col(w4_{i}, xo4 + {c}u * xs);");
+                }
+            }
+            w << "        }\n";
+        }
+        w << "    }\n";
+        // the value stored for row i, column c
+        std::string out = "a{i}_{c}";
+        if (fuse.glu) {
+            out = "(a{i}_{c} / (1.0 + exp(-a{i}_{c})) * b{i}_{c})";  // as glu.wgsl's SwiGLU
+        }
+        const std::string at = "{c}u * params.m + row{i}";
+        std::string       store;
+        if (fuse.add_in_dst) {
+            store = "let o = params.offset_dst + " + at + "; dst[o] = " + out + " + dst[o];";
+        } else if (fuse.add) {
+            store = "dst[params.offset_dst + " + at + "] = " + out + " + addv[params.stride_12 + " + at + "];";
+        } else if (fuse.stage_out) {
+            store = "let v = " + out + "; dst[params.offset_dst + " + at + "] = v; staged_out[" + at + "] = v;";
+        } else {
+            store = "dst[params.offset_dst + " + at + "] = " + out + ";";
+        }
+        // the stores of the rows in range (columns past n are not stored)
+        auto store_rows = [&]() {
+            for (uint32_t i = 0; i < rb; i++) {
+                w << sub("        if (row{i} < params.m) {", i, 0) << "\n";
+                for (uint32_t c = 0; c < ncol; c++) {
+                    w << sub("            if ({c}u < params.n) { " + store + " }", i, c) << "\n";
+                }
+                w << "        }\n";
+            }
+        };
+        if (ppt == 2) {
+            // the first step of the lanes' tree (lane l plus lane l + 4)
+            GGML_ASSERT(subgroups);
+            for (const std::string & v : prods) {
+                rows_cols("    " + v + "{i}_{c} += " + v + "{i}_{c}h;");
+            }
+        }
+        if (subgroups) {
+            for (const std::string & v : prods) {
+                for (uint32_t s = tpr / 2; s > 0; s >>= 1) {
+                    rows_cols("    " + v + "{i}_{c} += subgroupShuffleXor(" + v + "{i}_{c}, " + std::to_string(s) + "u);");
+                }
+            }
+            w << "    if (t == 0u) {\n";
+            store_rows();
+            w << "    }\n";
+        } else {
+            // the sums of product p, row i, column c at ((p * rb + i) * ncol + c) * WG_SIZE
+            auto slot = [&](size_t p) {
+                return "((" + std::to_string(p * rb) + "u + {i}u) * " + std::to_string(ncol) + "u + {c}u) * " +
+                       std::to_string(WEBGPU_MUL_MAT_VEC_PVR_WG_SIZE) + "u";
+            };
+            for (size_t p = 0; p < prods.size(); p++) {
+                rows_cols("    partial_sums[" + slot(p) + " + li] = " + prods[p] + "{i}_{c};");
+            }
+            w << "    workgroupBarrier();\n";
+            w << "    for (var s = TPR / 2u; s > 0u; s >>= 1u) {\n";
+            w << "        if (t < s) {\n";
+            for (size_t p = 0; p < prods.size(); p++) {
+                rows_cols("            partial_sums[" + slot(p) + " + li] += partial_sums[" + slot(p) + " + li + s];");
+            }
+            w << "        }\n";
+            w << "        workgroupBarrier();\n";
+            w << "    }\n";
+            w << "    if (t == 0u) {\n";
+            for (size_t p = 0; p < prods.size(); p++) {
+                rows_cols("        " + prods[p] + "{i}_{c} = partial_sums[" + slot(p) + " + li];");
+            }
+            store_rows();
+            w << "    }\n";
+        }
+        return w.str();
+    }
+
+    // rows per thread of mul_mat_vec_pvr.wgsl: two for a Q4_K product on one
+    // column (fewer loads of the vector), one otherwise
+    static uint32_t ggml_webgpu_mul_mat_vec_pvr_rb(ggml_type src0_type,
+                                                   uint32_t  ncol,
+                                                   const ggml_webgpu_mul_mat_vec_pvr_fusion & fuse) {
+        return src0_type == GGML_TYPE_Q4_K && ncol == 1 && !fuse.glu ? 2 : 1;
+    }
+
+    // The fastest shape on PowerVR for a product of m rows (measured on the
+    // Pixel 10's): for repacked weights and one column, two rows per thread
+    // for Q4_K from 2048 rows (one below, where two would leave too few
+    // workgroups), and for Q6_K, 4 threads per row from 8192 rows (the output
+    // layer) and 8 below.
+    static ggml_webgpu_mul_mat_vec_pvr_shape ggml_webgpu_mul_mat_vec_pvr_choose_shape(
+        ggml_type                                  src0_type,
+        bool                                       layout_a,
+        uint32_t                                   ncol,
+        uint32_t                                   m,
+        bool                                       subgroups,
+        const ggml_webgpu_mul_mat_vec_pvr_fusion & fuse) {
+        ggml_webgpu_mul_mat_vec_pvr_shape shape;
+        shape.layout_a = layout_a;
+        shape.rb       = ggml_webgpu_mul_mat_vec_pvr_rb(src0_type, ncol, fuse);
+        if (layout_a && ncol == 1 && !fuse.glu) {
+            if (src0_type == GGML_TYPE_Q4_K) {
+                shape.rb = m >= 2048 ? 2 : 1;
+            } else if (subgroups && m >= 8192) {
+                shape.tpr = 4;
+            }
+        }
+        return shape;
+    }
+
+
+    // PowerVR mat-vec (see mul_mat_vec_pvr.wgsl) for ncol columns; src0_ro binds the weights read-only,
+    // subgroups adds up a row's lanes with shuffles, fuse is what it fuses in
+    webgpu_pipeline get_mul_mat_vec_pvr_pipeline(ggml_type                      src0_type,
+                                                 bool                           src0_ro,
+                                                 uint32_t                       ncol      = 1,
+                                                 bool                           subgroups = false,
+                                                 const ggml_webgpu_mul_mat_vec_pvr_fusion & fuse      = {},
+                                                 const ggml_webgpu_mul_mat_vec_pvr_shape &  shape_in  = {}) {
+        ggml_webgpu_mul_mat_vec_pvr_shape shape = shape_in;
+        if (!shape.layout_a && shape.tpr == 0 && shape.rb == 1) {
+            // the original layout keeps its original shapes
+            shape.rb = ggml_webgpu_mul_mat_vec_pvr_rb(src0_type, ncol, fuse);
+        }
+        const int key = (((((int) src0_type * 2 + (src0_ro ? 1 : 0)) * 32 + (int) ncol) * 2 + (subgroups ? 1 : 0)) * 16 +
+                         fuse.key()) * 256 + shape.key();
+        auto it = mul_mat_vec_pvr_pipelines.find(key);
+        if (it != mul_mat_vec_pvr_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines;
+        std::string              variant = "mul_mat_vec_pvr";
+        uint32_t                 rows_per_wg;
+        switch (src0_type) {
+            case GGML_TYPE_Q4_K:
+                defines.push_back("Q4_K");
+                variant += "_q4_K";
+                rows_per_wg = WEBGPU_MUL_MAT_VEC_PVR_Q4_K_ROWS;
+                break;
+            case GGML_TYPE_Q6_K:
+                defines.push_back("Q6_K");
+                variant += "_q6_K";
+                rows_per_wg = WEBGPU_MUL_MAT_VEC_PVR_Q6_K_ROWS;
+                break;
+            default:
+                GGML_ABORT("Unsupported src0 type for the PowerVR mat-vec shader");
+        }
+        if (src0_ro) {
+            defines.push_back("SRC0_RO");
+            variant += "_ro";
+        }
+        if (shape.tpr != 0) {
+            rows_per_wg = WEBGPU_MUL_MAT_VEC_PVR_WG_SIZE / shape.tpr;
+        }
+        const uint32_t tpr = WEBGPU_MUL_MAT_VEC_PVR_WG_SIZE / rows_per_wg;
+        const uint32_t rb  = shape.rb;
+        rows_per_wg *= rb;
+        if (shape.layout_a) {
+            defines.push_back("LAYOUT_A");
+            variant += "_la";
+            if (src0_type == GGML_TYPE_Q6_K && (ncol > 1 || fuse.glu)) {
+                // several columns: read as the original layout's code does, to keep
+                // each column's bits those of the one-column product (see the shader)
+                defines.push_back("Q6_A_LD");
+            }
+        }
+        if (rb != 1 || shape.tpr != 0) {
+            variant += "_rb" + std::to_string(rb) + "_tpr" + std::to_string(tpr);
+        }
+        defines.push_back("WG_SIZE=" + std::to_string(WEBGPU_MUL_MAT_VEC_PVR_WG_SIZE) + "u");
+        defines.push_back("ROWS_PER_WG=" + std::to_string(rows_per_wg) + "u");
+        defines.push_back("RB=" + std::to_string(rb) + "u");
+        // the workgroup memory holds the sums of every row, column and product of a thread
+        defines.push_back("NCOL=" + std::to_string((fuse.glu ? 2 : 1) * rb * ncol) + "u");
+        if (ncol > 1) {
+            variant += "_ncol" + std::to_string(ncol);
+        }
+        if (subgroups) {
+            defines.push_back("USE_SUBGROUPS");
+            variant += "_sg";
+        }
+        if (fuse.add && !fuse.add_in_dst) {
+            defines.push_back("ADD");
+            variant += "_add";
+        }
+        if (fuse.add_in_dst) {
+            variant += "_add_in_dst";
+        }
+        if (fuse.glu) {
+            defines.push_back("GLU");
+            variant += "_swiglu";
+        }
+        if (fuse.stage_out) {
+            defines.push_back("STAGE_OUT");
+            variant += "_stage";
+        }
+        // the bindings after dst, in order, then the parameters
+        uint32_t binding = 3;
+        if (fuse.add && !fuse.add_in_dst) {
+            defines.push_back("ADD_BINDING=" + std::to_string(binding++));
+        }
+        if (fuse.glu) {
+            defines.push_back("SRC0B_BINDING=" + std::to_string(binding++));
+        }
+        if (fuse.stage_out) {
+            defines.push_back("STAGE_BINDING=" + std::to_string(binding++));
+        }
+        defines.push_back("PARAMS_BINDING=" + std::to_string(binding));
+
+        auto processed = preprocessor.preprocess(wgsl_mul_mat_vec_pvr, defines);
+        if (fuse.glu) {
+            // the weight-reading helpers again, reading src0b
+            const auto b = processed.find("// HELPERS_BEGIN");
+            const auto e = processed.find("// HELPERS_END");
+            GGML_ASSERT(b != std::string::npos && e != std::string::npos);
+            std::string helpers = processed.substr(b, e - b);
+            for (const auto & [from, to] : std::vector<std::pair<std::string, std::string>>{
+                     { "src0[", "src0b[" }, { "ld(", "ld_b(" }, { "q4k_unpack(", "q4k_unpack_b(" }, { "q6k_unpack(", "q6k_unpack_b(" },
+                     { "q4k_unpack_a(", "q4k_unpack_a_b(" }, { "q6k_unpack_a(", "q6k_unpack_a_b(" } }) {
+                for (size_t pos = 0; (pos = helpers.find(from, pos)) != std::string::npos; pos += to.size()) {
+                    helpers.replace(pos, from.size(), to);
+                }
+            }
+            processed.insert(e, helpers);
+        }
+        const auto body_at = processed.rfind("MAIN_BODY");
+        GGML_ASSERT(body_at != std::string::npos);
+        processed.replace(body_at, sizeof("MAIN_BODY") - 1,
+                          ggml_webgpu_mul_mat_vec_pvr_body(src0_type == GGML_TYPE_Q4_K, ncol, rb, subgroups, tpr, fuse,
+                                                           shape.layout_a));
+        auto decisions                 = std::make_shared<ggml_webgpu_mul_mat_vec_shader_decisions>();
+        decisions->wg_size             = WEBGPU_MUL_MAT_VEC_PVR_WG_SIZE;
+        decisions->outputs_per_wg      = rows_per_wg;
+        decisions->vec_size            = 1;
+        webgpu_pipeline pipeline       = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context               = decisions;
+        mul_mat_vec_pvr_pipelines[key] = pipeline;
+        return pipeline;
+    }
+
+    // PowerVR mat-mat (see mul_mat_pvr.wgsl); src0_ro binds the weights read-only
+    webgpu_pipeline get_mul_mat_pvr_pipeline(ggml_type src0_type, bool src0_ro, bool layout_a = false) {
+        const int key = ((int) src0_type * 2 + (src0_ro ? 1 : 0)) * 2 + (layout_a ? 1 : 0);
+        auto      it  = mul_mat_pvr_pipelines.find(key);
+        if (it != mul_mat_pvr_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines;
+        std::string              variant = "mul_mat_pvr";
+        switch (src0_type) {
+            case GGML_TYPE_Q4_K:
+                defines.push_back("Q4_K");
+                variant += "_q4_K";
+                break;
+            case GGML_TYPE_Q6_K:
+                defines.push_back("Q6_K");
+                variant += "_q6_K";
+                break;
+            default:
+                GGML_ABORT("Unsupported src0 type for the PowerVR mat-mat shader");
+        }
+        if (src0_ro) {
+            defines.push_back("SRC0_RO");
+            variant += "_ro";
+        }
+        if (layout_a) {
+            defines.push_back("LAYOUT_A");
+            variant += "_la";
+        }
+        auto            processed = preprocessor.preprocess(wgsl_mul_mat_pvr, defines);
+        webgpu_pipeline pipeline  = ggml_webgpu_create_pipeline(device, processed, variant);
+        mul_mat_pvr_pipelines[key] = pipeline;
+        return pipeline;
+    }
+
+    // PowerVR flash attention for one query token, or a few (see flash_attn_pvr.wgsl)
+    webgpu_pipeline get_flash_attn_pvr_pipeline(uint32_t head_dim, bool has_mask, bool kv_ro, uint32_t wg_mem_limit) {
+        const uint32_t wg_size = ggml_webgpu_flash_attn_pvr_wg_size(head_dim, wg_mem_limit);
+        GGML_ASSERT(wg_size > 0);
+        const int key = ((int) head_dim * 4 + (has_mask ? 2 : 0) + (kv_ro ? 1 : 0)) * 128 + (int) wg_size;
+        auto      it  = flash_attn_pvr_pipelines.find(key);
+        if (it != flash_attn_pvr_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines = { "HEAD_DIM=" + std::to_string(head_dim) + "u",
+                                             "WG_SIZE=" + std::to_string(wg_size) + "u" };
+        std::string              variant = "flash_attn_pvr_hs" + std::to_string(head_dim);
+        if (has_mask) {
+            defines.push_back("HAS_MASK");
+            variant += "_mask";
+        }
+        if (kv_ro) {
+            defines.push_back("KV_RO");
+            variant += "_kv_ro";
+        }
+        auto processed           = preprocessor.preprocess(wgsl_flash_attn_pvr, defines);
+        auto decisions           = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size       = wg_size;
+        webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context         = decisions;
+        flash_attn_pvr_pipelines[key] = pipeline;
+        return pipeline;
+    }
+
+    // PowerVR flash attention for several query rows (see flash_attn_pvr_mq.wgsl): split threads share a row
+    webgpu_pipeline get_flash_attn_pvr_mq_pipeline(uint32_t head_dim, uint32_t split, bool has_mask, bool kv_ro) {
+        const int key = ((int) head_dim * 8 + (int) split) * 4 + (has_mask ? 2 : 0) + (kv_ro ? 1 : 0);
+        auto      it  = flash_attn_pvr_mq_pipelines.find(key);
+        if (it != flash_attn_pvr_mq_pipelines.end()) {
+            return it->second;
+        }
+        const uint32_t           wg_size = WEBGPU_FLASH_ATTN_PVR_MQ_ROWS * split;
+        std::vector<std::string> defines = { "HEAD_DIM=" + std::to_string(head_dim) + "u",
+                                             "WG_SIZE=" + std::to_string(wg_size) + "u",
+                                             "SPLIT=" + std::to_string(split) };
+        std::string variant = "flash_attn_pvr_mq_hs" + std::to_string(head_dim) + "_split" + std::to_string(split);
+        if (has_mask) {
+            defines.push_back("HAS_MASK");
+            variant += "_mask";
+        }
+        if (kv_ro) {
+            defines.push_back("KV_RO");
+            variant += "_kv_ro";
+        }
+        auto processed           = preprocessor.preprocess(wgsl_flash_attn_pvr_mq, defines);
+        webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, variant);
+        flash_attn_pvr_mq_pipelines[key] = pipeline;
+        return pipeline;
+    }
+
+    // out_f16 packs src1 as f16 pairs, for mul_mat_pvr_gemm.wgsl
+    // PowerVR logits top-k (see topk_pvr.wgsl): stage 1, 2 or 3, for k values, groups of `group` values,
+    // g_max groups and cap candidates per row
+    webgpu_pipeline get_topk_pvr_pipeline(uint32_t stage, uint32_t k, uint32_t group, uint32_t g_max, uint32_t cap) {
+        std::string variant = "topk_pvr_s" + std::to_string(stage) + "_k" + std::to_string(k) + "_gs" +
+                              std::to_string(group) + "_g" + std::to_string(g_max) + "_c" + std::to_string(cap);
+        auto it = topk_pvr_pipelines.find(variant);
+        if (it != topk_pvr_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines = { "STAGE" + std::to_string(stage), "K=" + std::to_string(k) + "u",
+                                             "GROUP=" + std::to_string(group) + "u",
+                                             "G_MAX=" + std::to_string(g_max) + "u",
+                                             "CAP=" + std::to_string(cap) + "u" };
+        auto            processed = preprocessor.preprocess(wgsl_topk_pvr, defines);
+        webgpu_pipeline pipeline     = ggml_webgpu_create_pipeline(device, processed, variant);
+        topk_pvr_pipelines[variant] = pipeline;
+        return pipeline;
+    }
+
+    // The body of shortconv_pvr.wgsl's main() for n tokens and a conv of width taps (ds = width - 1
+    // state values): v0 .. v(ds - 1) the old state, v(ds + t) token t's B * X, then each token's conv
+    // (fused multiply-adds from 0, tap 0 first, as ssm_conv.wgsl's loop compiles on PowerVR) times C,
+    // and the snapshots (slot s: v(n - s) .. v(n - s + ds - 1)).
+    static std::string ggml_webgpu_shortconv_pvr_body(uint32_t n, uint32_t width) {
+        const uint32_t     ds = width - 1;
+        std::ostringstream b;
+        b << "    let st = params.offset_state + row * params.stride_state + " << ds << "u * ch;\n";
+        for (uint32_t j = 0; j < width; j++) {
+            b << "    let w" << j << " = w[params.offset_w + " << width << "u * ch + " << j << "u];\n";
+        }
+        for (uint32_t j = 0; j < ds; j++) {
+            b << "    let v" << j << " = cache[st + " << j << "u];\n";
+        }
+        for (uint32_t t = 0; t < n; t++) {
+            b << "    let v" << t + ds << " = bcx[params.offset_b + " << t << "u * params.stride_bcx + ch] * bcx[params.offset_x + "
+              << t << "u * params.stride_bcx + ch];\n";
+        }
+        for (uint32_t t = 0; t < n; t++) {
+            b << "    {\n";
+            b << "        var sum = 0.0;\n";
+            for (uint32_t j = 0; j < width; j++) {
+                b << "        sum = fma(v" << t + j << ", w" << j << ", sum);\n";
+            }
+            b << "        let r = bcx[params.offset_c + " << t << "u * params.stride_bcx + ch] * sum;\n";
+            b << "        y[params.offset_y + " << t << "u * params.stride_y + ch] = r;\n";
+            b << "        staged[" << t << "u * params.channels + ch] = r;\n";
+            b << "    }\n";
+        }
+        for (uint32_t s = 0; s < n; s++) {
+            b << "    if (" << s << "u < params.n_snap) {\n";
+            for (uint32_t j = 0; j < ds; j++) {
+                b << "        cache[params.snap" << s << " + " << ds << "u * ch + " << j << "u] = v" << n - s + j << ";\n";
+            }
+            b << "    }\n";
+        }
+        return b.str();
+    }
+
+    // PowerVR: LFM's short convolution on n tokens in one dispatch, a conv of width taps (see
+    // shortconv_pvr.wgsl); w_ro binds the weights read-only
+    webgpu_pipeline get_shortconv_pvr_pipeline(uint32_t n, uint32_t width, bool w_ro) {
+        const int key = ((int) n * 16 + (int) width) * 2 + (w_ro ? 1 : 0);
+        auto      it  = shortconv_pvr_pipelines.find(key);
+        if (it != shortconv_pvr_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines = { "N=" + std::to_string(n) + "u",
+                                             "WG_SIZE=" + std::to_string(WEBGPU_SHORTCONV_PVR_WG_SIZE) + "u" };
+        std::string              variant = "shortconv_pvr_n" + std::to_string(n) + "_w" + std::to_string(width);
+        if (w_ro) {
+            defines.push_back("W_RO");
+            variant += "_wro";
+        }
+        auto       processed = preprocessor.preprocess(wgsl_shortconv_pvr, defines);
+        const auto body_at   = processed.rfind("MAIN_BODY");
+        GGML_ASSERT(body_at != std::string::npos);
+        processed.replace(body_at, sizeof("MAIN_BODY") - 1, ggml_webgpu_shortconv_pvr_body(n, width));
+        webgpu_pipeline pipeline       = ggml_webgpu_create_pipeline(device, processed, variant);
+        shortconv_pvr_pipelines[key]   = pipeline;
+        return pipeline;
+    }
+
+    // PowerVR: post-norm, residual add and the next norm in one dispatch (see rms_norm_add_pvr.wgsl)
+    webgpu_pipeline get_rms_norm_add_pvr_pipeline(uint32_t wg_size) {
+        if (!rms_norm_add_pvr_pipeline.pipeline) {
+            std::vector<std::string> defines   = { "WG_SIZE=" + std::to_string(wg_size) + "u" };
+            auto                     processed = preprocessor.preprocess(wgsl_rms_norm_add_pvr, defines);
+            rms_norm_add_pvr_pipeline          = ggml_webgpu_create_pipeline(device, processed, "rms_norm_add_pvr");
+        }
+        return rms_norm_add_pvr_pipeline;
+    }
+
+    webgpu_pipeline get_mul_mat_pvr_stage_pipeline(bool out_f16) {
+        webgpu_pipeline & pipeline = out_f16 ? mul_mat_pvr_stage_f16_pipeline : mul_mat_pvr_stage_pipeline;
+        if (!pipeline.pipeline) {
+            std::vector<std::string> defines = { "WG_SIZE=" + std::to_string(WEBGPU_MUL_MAT_PVR_STAGE_WG_SIZE) };
+            if (out_f16) {
+                defines.push_back("OUT_F16");
+            }
+            auto processed = preprocessor.preprocess(wgsl_mul_mat_pvr_stage, defines);
+            pipeline = ggml_webgpu_create_pipeline(device, processed, out_f16 ? "mul_mat_pvr_stage_f16" : "mul_mat_pvr_stage");
+        }
+        return pipeline;
+    }
+
+    // PowerVR prompt batches: Q4_K or Q6_K weights to f16 (see mul_mat_pvr_dequant.wgsl)
+    webgpu_pipeline get_mul_mat_pvr_dequant_pipeline(ggml_type src0_type, bool layout_a = false) {
+        const int key = (int) src0_type * 2 + (layout_a ? 1 : 0);
+        auto      it  = mul_mat_pvr_dequant_pipelines.find(key);
+        if (it != mul_mat_pvr_dequant_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> defines = { "WG_SIZE=" + std::to_string(WEBGPU_MUL_MAT_PVR_DEQUANT_WG_SIZE) + "u",
+                                             "TEX_W=" + std::to_string(WEBGPU_MUL_MAT_PVR_TEX_W) + "u" };
+        std::string              variant = "mul_mat_pvr_dequant";
+        switch (src0_type) {
+            case GGML_TYPE_Q4_K:
+                defines.push_back("Q4_K");
+                variant += "_q4_K";
+                break;
+            case GGML_TYPE_Q6_K:
+                defines.push_back("Q6_K");
+                variant += "_q6_K";
+                break;
+            default:
+                GGML_ABORT("Unsupported src0 type for the PowerVR dequantize shader");
+        }
+        if (layout_a) {
+            defines.push_back("LAYOUT_A");
+            variant += "_la";
+        }
+        auto            processed = preprocessor.preprocess(wgsl_mul_mat_pvr_dequant, defines);
+        webgpu_pipeline pipeline  = ggml_webgpu_create_pipeline(device, processed, variant);
+        mul_mat_pvr_dequant_pipelines[key] = pipeline;
+        return pipeline;
+    }
+
+    // PowerVR prompt batches: f16 x f16 mat-mat (see mul_mat_pvr_gemm.wgsl). glu: 0, or SwiGLU fused in
+    // with the product as its up (1) or gate (2) operand
+    webgpu_pipeline get_mul_mat_pvr_gemm_pipeline(int glu = 0) {
+        webgpu_pipeline & pipeline = mul_mat_pvr_gemm_pipelines[glu];
+        if (!pipeline.pipeline) {
+            std::vector<std::string> defines = { "TEX_W=" + std::to_string(WEBGPU_MUL_MAT_PVR_TEX_W) + "u" };
+            std::string              variant = "mul_mat_pvr_gemm";
+            if (glu) {
+                defines.push_back("GLU");
+                variant += "_swiglu";
+            }
+            if (glu == 2) {
+                defines.push_back("MM_IS_GATE");
+                variant += "_gate";
+            }
+            auto processed = preprocessor.preprocess(wgsl_mul_mat_pvr_gemm, defines);
+            pipeline       = ggml_webgpu_create_pipeline(device, processed, variant);
+        }
+        return pipeline;
+    }
+
     webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
         ggml_webgpu_mul_mat_pipeline_key key = {};
         key.src0_type                        = context.src0->type;
@@ -2791,11 +3429,14 @@ class ggml_webgpu_shader_lib {
         return unary_pipelines[key];
     }
 
-    webgpu_pipeline get_rms_norm_mul_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+    webgpu_pipeline get_rms_norm_mul_pipeline(const ggml_webgpu_shader_lib_context & context,
+                                              bool                                   src_overlap,
+                                              bool                                   staged = false) {
         ggml_webgpu_rms_norm_mul_pipeline_key key = {};
         key.inplace                               = ggml_webgpu_tensor_equal(context.src0, context.dst);
         key.overlap                               = ggml_webgpu_tensor_equal(context.src1, context.dst);
         key.src_overlap                           = src_overlap;
+        key.staged                                = staged && !key.inplace && !key.overlap && !src_overlap;
 
         auto it = rms_norm_mul_pipelines.find(key);
         if (it != rms_norm_mul_pipelines.end()) {
@@ -2815,6 +3456,9 @@ class ggml_webgpu_shader_lib {
         } else if (key.src_overlap) {
             defines.push_back("SRC_OVERLAP");
             variant += "_src_overlap";
+        } else if (key.staged) {
+            defines.push_back("STAGED");
+            variant += "_staged";
         }
 
         defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
