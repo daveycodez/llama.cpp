@@ -69,7 +69,7 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
 
         for (int j = 0; j < 8; j++) {
-            const v128_t v  = wasm_f32x4_mul(srcv[j], wasm_f32x4_splat(id));
+            const v128_t v  = wasm_f32x4_nearest(wasm_f32x4_mul(srcv[j], wasm_f32x4_splat(id)));
             const v128_t vi = wasm_i32x4_trunc_sat_f32x4(v);
 
             y[i].qs[4*j + 0] = wasm_i32x4_extract_lane(vi, 0);
@@ -116,7 +116,7 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         v128_t accv = wasm_i32x4_splat(0);
 
         for (int j = 0; j < 8; j++) {
-            const v128_t v  = wasm_f32x4_mul(srcv[j], wasm_f32x4_splat(id));
+            const v128_t v  = wasm_f32x4_nearest(wasm_f32x4_mul(srcv[j], wasm_f32x4_splat(id)));
             const v128_t vi = wasm_i32x4_trunc_sat_f32x4(v);
 
             y[i].qs[4*j + 0] = wasm_i32x4_extract_lane(vi, 0);
