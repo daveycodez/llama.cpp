@@ -1816,6 +1816,37 @@ static void test_msg_token_delimiters_split() {
     }
 }
 
+// LFM2 templates use a dedicated handler, which must give the server the message
+// delimiters itself so that it can place context checkpoints at user messages
+static void test_lfm2_message_delimiters() {
+    LOG_DBG("%s\n", __func__);
+
+    for (const char * path : {
+             "models/templates/LFM2-8B-A1B.jinja",
+             "models/templates/LFM2.5-Instruct.jinja",
+             "models/templates/LFM2.5-8B-A1B.jinja",
+         }) {
+        auto tmpls = read_templates(path);
+        common_chat_templates_inputs inputs;
+        inputs.messages              = { message_user, message_assist, message_user };
+        inputs.add_generation_prompt = true;
+        auto params = common_chat_templates_apply(tmpls.get(), inputs);
+
+        bool has_user      = false;
+        bool has_assistant = false;
+        for (const auto & d : params.message_delimiters.delimiters) {
+            has_user      |= d.role == COMMON_CHAT_ROLE_USER;
+            has_assistant |= d.role == COMMON_CHAT_ROLE_ASSISTANT;
+            if (d.role == COMMON_CHAT_ROLE_USER || d.role == COMMON_CHAT_ROLE_ASSISTANT) {
+                assert_contains(params.prompt.str(), d.delimiter);
+            }
+        }
+        if (!has_user || !has_assistant) {
+            throw std::runtime_error(std::string("Missing user or assistant message delimiter for ") + path);
+        }
+    }
+}
+
 static void test_tools_oaicompat_json_conversion() {
     LOG_DBG("%s\n", __func__);
     std::vector<common_chat_tool> tools{
@@ -8524,6 +8555,7 @@ int main(int argc, char ** argv) {
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
+        test_lfm2_message_delimiters();
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();

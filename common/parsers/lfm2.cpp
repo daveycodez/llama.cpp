@@ -46,6 +46,13 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
     data.thinking_start_tag = THINK_START;
     data.thinking_end_tags  = {THINK_END};
 
+    data.message_delimiters = {
+        { COMMON_CHAT_ROLE_ASSISTANT, "<|im_start|>assistant" },
+        { COMMON_CHAT_ROLE_USER,      "<|im_start|>user"      },
+        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>tool"      },
+        { COMMON_CHAT_ROLE_SYSTEM,    "<|im_start|>system"    },
+    };
+
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
     // Gate by reasoning format and whether the template supports <think>
