@@ -196,11 +196,15 @@ fn main(
                 dst[y_idx] = sum;
             }
 #else
-            for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
-                if (tid < stride) {
-                    shared_reduce[reduce_idx] += shared_reduce[reduce_idx + stride];
+            // WG_SIZE is d_state, which need not be a power of two (96):
+            // each step folds the upper half, rounded down, onto the lower
+            for (var width = WG_SIZE; width > 1u; ) {
+                let half = (width + 1u) / 2u;
+                if (tid < width - half) {
+                    shared_reduce[reduce_idx] += shared_reduce[reduce_idx + half];
                 }
                 workgroupBarrier();
+                width = half;
             }
 
             if (tid == 0u) {
