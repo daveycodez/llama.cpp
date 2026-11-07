@@ -615,7 +615,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
 
         ggml_add_cpu_backend_features(${GGML_CPU_NAME} s390 ${ARCH_DEFINITIONS})
-    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "wasm")
+    elseif (EMSCRIPTEN OR CMAKE_SYSTEM_PROCESSOR MATCHES "wasm")
+        # Emscripten's toolchain reports CMAKE_SYSTEM_PROCESSOR as "x86" unless
+        # EMSCRIPTEN_SYSTEM_PROCESSOR is set, so check EMSCRIPTEN as well
         message(STATUS "Wasm detected")
         list (APPEND GGML_CPU_SOURCES ggml-cpu/arch/wasm/quants.c)
     else()
